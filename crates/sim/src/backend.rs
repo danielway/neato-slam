@@ -1,10 +1,9 @@
 use std::collections::VecDeque;
 use std::io;
 
-use robot_msgs::{Command, Msg, Pose2, Stamped};
-use sim::Sim;
+use robot::{Command, Msg, Pose2, RobotIo, Stamped};
 
-use crate::RobotIo;
+use crate::Sim;
 
 /// The simulator, stepped on demand so it runs as fast as it is consumed.
 /// It never ends on its own.

@@ -1,11 +1,10 @@
 use std::io;
 
-use robot_msgs::wire::{self, MAX_FRAME_LEN};
-use robot_msgs::{Command, Msg, Pose2, Stamped};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
-use crate::RobotIo;
+use crate::wire::{self, MAX_FRAME_LEN};
+use crate::{Command, Msg, Pose2, RobotIo, Stamped};
 
 /// The physical robot, through `pi-node` over TCP.
 pub struct RealBackend {
@@ -55,7 +54,7 @@ impl RobotIo for RealBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use robot_msgs::WheelPositions;
+    use crate::WheelPositions;
     use tokio::net::TcpListener;
 
     #[tokio::test]

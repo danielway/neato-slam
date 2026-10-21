@@ -9,16 +9,12 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
-robot-msgs = { path = "crates/robot-msgs" }
-neato-proto = { path = "crates/neato-proto" }
-robot-io = { path = "crates/robot-io" }
+robot = { path = "crates/robot" }
 sim = { path = "crates/sim" }
 slam = { path = "crates/slam" }
-eval = { path = "crates/eval" }
-recorder = { path = "crates/recorder" }
 
 anyhow = "1"
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 toml = "1"

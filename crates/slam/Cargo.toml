@@ -1,10 +1,10 @@
 [package]
 name = "slam"
-description = "SLAM algorithms; pure computation, no I/O"
+description = "SLAM algorithms and their scoring; pure computation, no I/O"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-robot-msgs.workspace = true
+robot.workspace = true

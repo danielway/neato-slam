@@ -4,9 +4,8 @@
 //! come next.
 
 use anyhow::Result;
-use robot_io::{RobotIo, SimBackend};
-use robot_msgs::{Command, Msg, Pose2, RobotConfig};
-use sim::{Sim, World};
+use robot::{Command, Msg, Pose2, RobotConfig, RobotIo};
+use sim::{Sim, SimBackend, World};
 use slam::odometry::WheelOdometry;
 
 const ROBOT_TOML: &str = include_str!("../../../robot.toml");

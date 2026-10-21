@@ -1,0 +1,19 @@
+# cargo-deny checks every dependency for known vulnerabilities, unexpected
+# licenses and sources other than crates.io. Run with `cargo deny check`.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+# Our own crates are unpublished and carry no license field.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

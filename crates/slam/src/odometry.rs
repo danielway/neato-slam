@@ -1,4 +1,4 @@
-use robot_msgs::{Pose2, WheelPositions};
+use robot::{Pose2, WheelPositions};
 
 /// Dead reckoning from cumulative wheel positions. This is the baseline every
 /// later algorithm has to beat.

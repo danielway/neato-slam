@@ -1,4 +1,4 @@
-use robot_msgs::{Pose2, normalize_angle};
+use robot::{Pose2, normalize_angle};
 
 /// Ideal differential-drive kinematics.
 #[derive(Debug, Clone)]

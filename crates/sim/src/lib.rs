@@ -7,13 +7,15 @@
 //! dropouts, motion skew within a scan, collisions and bumpers. Their
 //! parameters will be fitted from real logs.
 
+mod backend;
 mod drive;
 mod world;
 
+pub use backend::SimBackend;
 pub use drive::DiffDrive;
 pub use world::{Segment, World};
 
-use robot_msgs::{Command, LidarScan, Msg, Pose2, RobotConfig, Stamped, WheelPositions};
+use robot::{Command, LidarScan, Msg, Pose2, RobotConfig, Stamped, WheelPositions};
 
 pub struct Sim {
     pub world: World,

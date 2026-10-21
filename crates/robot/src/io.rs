@@ -1,19 +1,10 @@
-//! One interface over three interchangeable robot sources. SLAM, recording
-//! and the station only ever see `RobotIo`.
-
-mod real;
-mod replay;
-mod sim;
-
-pub use real::RealBackend;
-pub use replay::ReplayBackend;
-pub use sim::SimBackend;
-
 use std::future::Future;
 use std::io;
 
-use robot_msgs::{Command, Msg, Pose2, Stamped};
+use crate::{Command, Msg, Pose2, Stamped};
 
+/// One interface over the interchangeable robot sources. SLAM, recording and
+/// the station only ever see this.
 pub trait RobotIo {
     /// The next message, waiting if needed. None means the source has ended.
     fn recv(&mut self) -> impl Future<Output = io::Result<Option<Stamped<Msg>>>> + Send;

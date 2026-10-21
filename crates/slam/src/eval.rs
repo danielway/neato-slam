@@ -4,7 +4,7 @@
 //! alignment before ATE, Relative Pose Error, and TUM-format export so the
 //! `evo` tool can plot runs.
 
-use robot_msgs::Pose2;
+use robot::Pose2;
 
 /// Absolute Trajectory Error: RMS position error over pose pairs that are
 /// already time-associated and in the same frame. None if there are no pairs.

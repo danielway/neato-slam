@@ -1,9 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 
-use robot_msgs::{Command, Msg, Pose2, Stamped};
-
-use crate::RobotIo;
+use crate::{Command, Msg, Pose2, RobotIo, Stamped};
 
 /// Plays back a recorded run, as fast as it is read. Pacing to the original
 /// timing is the caller's job, using the stamps.
@@ -12,7 +10,10 @@ pub struct ReplayBackend {
 }
 
 impl ReplayBackend {
-    /// Until the MCAP reader lands in `recorder`, logs come in as lists.
+    /// Logs come in as lists until recording lands. The plan is MCAP files
+    /// with one channel per message type, one for commands sent, one for
+    /// ground truth when the source has it, and the run's `robot.toml` as
+    /// metadata, so sim and real runs look alike downstream.
     pub fn from_messages(messages: impl IntoIterator<Item = Stamped<Msg>>) -> Self {
         Self {
             messages: messages.into_iter().collect(),

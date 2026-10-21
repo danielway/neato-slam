@@ -1,13 +1,21 @@
-//! Message vocabulary shared by every backend, SLAM and tooling.
+//! What every part of the stack shares: the message vocabulary, the robot
+//! config, the Pi-to-desktop wire format, and the `RobotIo` interface with
+//! its real and replay backends. The sim backend lives in the `sim` crate.
 //!
 //! Messages carry raw readings rather than interpreted ones (wheel travel
 //! rather than velocities, ranges rather than points), so replay and the
 //! simulator feed SLAM exactly what the hardware produces.
 
 mod config;
+mod io;
+mod real;
+mod replay;
 pub mod wire;
 
 pub use config::{DriveConfig, LidarConfig, RobotConfig};
+pub use io::RobotIo;
+pub use real::RealBackend;
+pub use replay::ReplayBackend;
 
 use serde::{Deserialize, Serialize};
 

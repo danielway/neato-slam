@@ -5,4 +5,5 @@
 //! wheel odometry, scan matching, occupancy grid mapping, particle-filter
 //! SLAM, then pose-graph SLAM with loop closure.
 
+pub mod eval;
 pub mod odometry;

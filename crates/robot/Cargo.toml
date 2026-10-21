@@ -1,6 +1,6 @@
 [package]
-name = "robot-msgs"
-description = "Message vocabulary shared by the robot, replay, the simulator and SLAM"
+name = "robot"
+description = "Shared messages, robot config, wire format and the RobotIo interface"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,5 @@ publish.workspace = true
 [dependencies]
 postcard.workspace = true
 serde.workspace = true
+tokio.workspace = true
 toml.workspace = true

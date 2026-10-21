@@ -1,10 +1,10 @@
 [package]
 name = "sim"
-description = "2D simulator that produces the same messages as the real Neato"
+description = "2D simulator of the Neato, and the sim backend for RobotIo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-robot-msgs.workspace = true
+robot.workspace = true

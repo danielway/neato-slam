@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use robot_msgs::{Contacts, LidarScan, WheelPositions};
+use robot::{Contacts, LidarScan, WheelPositions};
 
 /// Marks the end of each response.
 pub const END_OF_RESPONSE: char = '\u{1a}';

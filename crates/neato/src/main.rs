@@ -5,9 +5,9 @@
 //!    `SetLDSRotation On`.
 //! 2. Accept one desktop connection on the listen address.
 //! 3. Poll `GetMotors` and `GetDigitalSensors` at the control rate and
-//!    `GetLDSScan` at the scan rate, parse with `neato-proto`, stamp each
+//!    `GetLDSScan` at the scan rate, parse with the `neato` library, stamp each
 //!    reading with the monotonic clock when it was taken, and stream them.
-//! 4. Turn each `Command` into `SetMotor` via `neato_proto::cmd`.
+//! 4. Turn each `Command` into `SetMotor` via `neato::cmd`.
 //! 5. Watchdog: stop the motors if no command arrives within 300 ms or the
 //!    connection drops.
 
