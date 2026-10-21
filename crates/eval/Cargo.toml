@@ -1,0 +1,10 @@
+[package]
+name = "eval"
+description = "Trajectory and map scoring against ground truth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+robot-msgs.workspace = true

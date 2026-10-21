@@ -1,0 +1,15 @@
+[package]
+name = "station"
+description = "Desktop control app: picks a backend, drives the robot, runs SLAM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+robot-io.workspace = true
+robot-msgs.workspace = true
+sim.workspace = true
+slam.workspace = true
+tokio.workspace = true

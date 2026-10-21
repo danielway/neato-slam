@@ -1,0 +1,12 @@
+[package]
+name = "robot-io"
+description = "The RobotIo interface and its real, replay and sim backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+robot-msgs.workspace = true
+sim.workspace = true
+tokio.workspace = true
