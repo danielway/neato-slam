@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+macroquad.workspace = true
 robot.workspace = true
 sim.workspace = true
 slam.workspace = true

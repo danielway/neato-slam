@@ -3,9 +3,18 @@
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # macroquad (the station's sim window) has soundness holes around its
+    # global state and no fixed release. The station uses it the ordinary
+    # way, on one thread and on no untrusted input.
+    { id = "RUSTSEC-2025-0035", reason = "macroquad, desktop-only viewer; no fix exists" },
+    # ttf-parser is unmaintained; macroquad's font rasterizer parses only
+    # its own built-in font with it.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser via macroquad, parses only the bundled font" },
+]
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]
 # Our own crates are unpublished and carry no license field.
 private = { ignore = true }
 

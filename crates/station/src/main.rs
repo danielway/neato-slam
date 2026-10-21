@@ -1,23 +1,37 @@
-//! The desktop control app. For now it runs a scripted drive in the
-//! simulator and compares wheel odometry with ground truth, end to end
-//! through `RobotIo`. Teleop, recording, a real-robot mode and a Rerun view
-//! come next.
+//! The desktop control app. By default it opens a window onto the
+//! simulator, driven from the keyboard through `RobotIo`. With `--headless`
+//! it runs a scripted drive and prints odometry against ground truth.
+//! Recording and a real-robot mode come next.
 
-use anyhow::Result;
+mod teleop;
+mod view;
+
+use anyhow::{Result, bail};
 use robot::{Command, Msg, Pose2, RobotConfig, RobotIo};
 use sim::{Sim, SimBackend, World};
 use slam::odometry::WheelOdometry;
 
 const ROBOT_TOML: &str = include_str!("../../../robot.toml");
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let config = RobotConfig::from_toml_str(ROBOT_TOML)?;
     let start = Pose2::new(1.0, 1.0, 0.0);
+    match std::env::args().nth(1).as_deref() {
+        None => {
+            macroquad::Window::from_config(view::conf(), view::run(config, start));
+            Ok(())
+        }
+        Some("--headless") => tokio::runtime::Runtime::new()?.block_on(headless(config, start)),
+        Some(other) => bail!("unknown argument {other:?}; expected nothing or --headless"),
+    }
+}
+
+/// Drives a gentle left arc for ten simulated seconds and reports how far
+/// odometry drifted from the truth.
+async fn headless(config: RobotConfig, start: Pose2) -> Result<()> {
     let mut odometry = WheelOdometry::new(start, config.drive.wheel_base_m);
     let mut robot = SimBackend::new(Sim::new(World::rectangle(5.0, 4.0), config, start, 0.01));
 
-    // Drive a gentle left arc for ten simulated seconds.
     robot
         .send(Command::WheelSpeeds {
             left_mm_s: 150.0,

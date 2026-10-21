@@ -16,7 +16,7 @@ SLAM and tooling talk to one interface, `RobotIo`, with three interchangeable ba
 | `neato` | Pi | Neato USB serial protocol, plus the `pi-node` binary that bridges it to the desktop (stub) |
 | `sim` | desktop | World, diff-drive kinematics, lidar raycasting, the sim backend |
 | `slam` | desktop | SLAM algorithms and their scoring against ground truth |
-| `station` | desktop | Control app; for now a scripted sim drive |
+| `station` | desktop | Control app: a sim window driven from the keyboard, or a scripted run |
 
 Robot geometry and sensor parameters live in [`robot.toml`](robot.toml). Values marked TODO still need measuring on the real robot.
 
@@ -24,8 +24,11 @@ Robot geometry and sensor parameters live in [`robot.toml`](robot.toml). Values 
 
 ```sh
 cargo test
-cargo run -p station   # drives the sim for 10 s and compares odometry with truth
+cargo run -p station                # opens the sim window
+cargo run -p station -- --headless  # drives the sim for 10 s and prints odometry against truth
 ```
+
+In the window, drive with WASD or the arrow keys (Shift for full speed). It shows the walls, the true pose and its trail in green, wheel odometry and its trail in orange, and the latest lidar scan in red. P pauses, R resets, O redraws the scan from the odometry pose instead of the true one, and Esc quits. On Linux the window needs the system OpenGL and X11 libraries (`libgl1`, `libx11-6`, `libxi6`), which desktops already have.
 
 `tools/capture-neato.sh` records the Neato's raw replies to the serial commands the stack uses (run it on the Pi with the robot plugged in). It never drives the wheels.
 
