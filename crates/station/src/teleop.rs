@@ -1,12 +1,13 @@
 use robot::Command;
+use serde::Deserialize;
 
 /// Wheel speed for driving straight, mm/s. Shift drives at the robot's limit.
 const DRIVE_MM_S: f32 = 200.0;
 /// Speed difference between the wheels when turning, mm/s.
 const TURN_MM_S: f32 = 100.0;
 
-/// The drive keys held this frame.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The drive keys held on the page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct Keys {
     pub forward: bool,
     pub back: bool,

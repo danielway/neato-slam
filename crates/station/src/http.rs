@@ -1,0 +1,171 @@
+//! A deliberately tiny HTTP/1.1 server, enough for one page, a stream of
+//! frames and a control endpoint, so the station needs no web framework.
+//!
+//! - `GET /` serves the page.
+//! - `GET /events` streams frames as server-sent events.
+//! - `POST /control` takes one JSON [`Control`].
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
+
+use crate::session::Control;
+
+const INDEX_HTML: &str = include_str!("../web/index.html");
+/// Longest request head or body accepted, in bytes.
+const MAX_REQUEST: usize = 16 * 1024;
+
+pub async fn serve(
+    listener: TcpListener,
+    controls: mpsc::Sender<Control>,
+    frames: watch::Receiver<Arc<str>>,
+) -> Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let (controls, frames) = (controls.clone(), frames.clone());
+        tokio::spawn(async move {
+            // A browser dropping a connection is routine, not worth a log line.
+            let _ = handle(stream, controls, frames).await;
+        });
+    }
+}
+
+struct Request {
+    method: String,
+    path: String,
+    json: bool,
+    body: Vec<u8>,
+}
+
+async fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line).await? == 0 {
+        return Ok(None);
+    }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+
+    let mut head_len = line.len();
+    let (mut content_length, mut json) = (0, false);
+    loop {
+        line.clear();
+        head_len += reader.read_line(&mut line).await?;
+        if head_len > MAX_REQUEST {
+            return Ok(None);
+        }
+        let header = line.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().unwrap_or(usize::MAX);
+        } else if name.eq_ignore_ascii_case("content-type") {
+            json = value.starts_with("application/json");
+        }
+    }
+    if content_length > MAX_REQUEST {
+        return Ok(None);
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(Request {
+        method,
+        path,
+        json,
+        body,
+    }))
+}
+
+async fn respond(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.shutdown().await
+}
+
+async fn handle(
+    stream: TcpStream,
+    controls: mpsc::Sender<Control>,
+    mut frames: watch::Receiver<Arc<str>>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream);
+    let Some(req) = read_request(&mut reader).await? else {
+        return Ok(());
+    };
+    let mut stream = reader.into_inner();
+    const TEXT: &str = "text/plain; charset=utf-8";
+
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => {
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                INDEX_HTML.as_bytes(),
+            )
+            .await
+        }
+        ("GET", "/events") => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await?;
+            loop {
+                let frame = frames.borrow_and_update().clone();
+                stream
+                    .write_all(format!("data: {frame}\n\n").as_bytes())
+                    .await?;
+                if frames.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        // Requiring a JSON content type makes browsers preflight cross-site
+        // requests, which this server never approves, so other web pages
+        // can't post controls to it.
+        ("POST", "/control") if !req.json => {
+            respond(
+                &mut stream,
+                "415 Unsupported Media Type",
+                TEXT,
+                b"expected application/json",
+            )
+            .await
+        }
+        ("POST", "/control") => match serde_json::from_slice::<Control>(&req.body) {
+            Ok(control) => {
+                let _ = controls.send(control).await;
+                respond(&mut stream, "204 No Content", TEXT, b"").await
+            }
+            Err(e) => {
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    TEXT,
+                    e.to_string().as_bytes(),
+                )
+                .await
+            }
+        },
+        _ => respond(&mut stream, "404 Not Found", TEXT, b"not found").await,
+    }
+}

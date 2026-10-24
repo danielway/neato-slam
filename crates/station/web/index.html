@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>neato-slam station</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #14161b; --panel: #1d2027; --border: #2c303a; --text: #d8dbe2; --muted: #8a909c;
+    --wall: #d9d9e0; --grid: rgba(255,255,255,0.05); --truth: #4ccc73; --odom: #f29933;
+    --hit: #ff4d4d; --ray: rgba(230,64,64,0.12); --accent: #5b8def; --warn: #e5a50a; --bad: #e5534b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f7; --panel: #ffffff; --border: #d9dce2; --text: #1d2027; --muted: #646a75;
+      --wall: #2a2d34; --grid: rgba(0,0,0,0.06); --truth: #1f9d4a; --odom: #d9770b;
+      --hit: #d42a2a; --ray: rgba(212,42,42,0.10); --accent: #2f6fe0; --warn: #b07800; --bad: #c9302c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border); }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  fieldset { display: flex; gap: 8px; align-items: center; border: 0; margin: 0; padding: 0; }
+  label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+  input[type=text] { width: 15em; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--bg); color: var(--text); font: inherit; }
+  button { padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg);
+    color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #state { font-weight: 600; }
+  #status { white-space: pre-wrap; }
+  .running, .connected { color: var(--truth); }
+  .paused, .connecting { color: var(--warn); }
+  .disconnected, .offline { color: var(--bad); }
+  main { flex: 1; position: relative; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+  footer { display: flex; flex-wrap: wrap; gap: 4px 20px; padding: 8px 16px; background: var(--panel);
+    border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  .key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>neato-slam station</h1>
+  <fieldset>
+    <label><input type="radio" name="backend" value="sim" checked> Sim</label>
+    <label><input type="radio" name="backend" value="real"> Real robot at</label>
+    <input type="text" id="addr" placeholder="192.168.1.50:7878" spellcheck="false" autocomplete="off">
+    <label title="Needs recorded logs, which aren't implemented yet"><input type="radio" name="backend" value="replay" disabled> Replay</label>
+    <button id="use" class="primary">Switch</button>
+  </fieldset>
+  <fieldset>
+    <button id="pause">Pause</button>
+    <button id="reset">Reset</button>
+    <label><input type="checkbox" id="odomFrame"> Draw scan from odometry</label>
+  </fieldset>
+</header>
+<main><canvas id="view" tabindex="0"></canvas></main>
+<footer>
+  <span id="state" class="offline">offline</span>
+  <span id="status"></span>
+  <span class="muted" id="help"></span>
+  <span class="muted"><span class="key" style="background:var(--truth)"></span>truth
+    <span class="key" style="background:var(--odom);margin-left:8px"></span>odometry
+    <span class="key" style="background:var(--hit);margin-left:8px"></span>lidar</span>
+</footer>
+<script>
+"use strict";
+const BODY_RADIUS_M = 0.165, TRAIL_STEP_M = 0.01;
+const $ = (id) => document.getElementById(id);
+const canvas = $("view"), ctx = canvas.getContext("2d");
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+$("addr").value = store.get("piAddr") || "";
+
+let frame = null, run = -1, trails = { truth: [], odom: [] }, bounds = null, dirty = true;
+
+function post(body) {
+  return fetch("/control", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body) }).catch(() => {});
+}
+
+// ---- Frames from the station ----
+function connect() {
+  const events = new EventSource("/events");
+  events.onmessage = (e) => { onFrame(JSON.parse(e.data)); };
+  events.onerror = () => { frame = null; setState("offline", "offline"); dirty = true; };
+}
+
+function pushTrail(trail, p) {
+  const last = trail[trail.length - 1];
+  if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) >= TRAIL_STEP_M) trail.push([p[0], p[1]]);
+}
+
+function grow(x, y) {
+  if (!bounds) bounds = { x0: x, y0: y, x1: x, y1: y };
+  bounds.x0 = Math.min(bounds.x0, x); bounds.y0 = Math.min(bounds.y0, y);
+  bounds.x1 = Math.max(bounds.x1, x); bounds.y1 = Math.max(bounds.y1, y);
+}
+
+function onFrame(f) {
+  if (f.run === undefined) return;
+  if (f.run !== run) {
+    run = f.run; trails = { truth: [], odom: [] }; bounds = null;
+    const radio = document.querySelector(`input[name=backend][value=${f.backend}]`);
+    if (radio) radio.checked = true;
+    if (f.addr) $("addr").value = f.addr;
+  }
+  frame = f;
+  if (f.truth) pushTrail(trails.truth, f.truth);
+  pushTrail(trails.odom, f.odometry);
+  // The view only ever grows within a run, so it doesn't jitter.
+  for (const w of f.walls) { grow(w[0], w[1]); grow(w[2], w[3]); }
+  for (const p of [f.truth, f.odometry]) if (p) { grow(p[0] - 1, p[1] - 1); grow(p[0] + 1, p[1] + 1); }
+  if (f.backend === "real") for (const h of worldHits(f, f.odometry)) grow(h[0], h[1]);
+  render();
+}
+
+function worldHits(f, pose) {
+  const [x, y, th] = pose, c = Math.cos(th), s = Math.sin(th);
+  return f.hits.map(([hx, hy]) => [x + c * hx - s * hy, y + s * hx + c * hy]);
+}
+
+function setState(text, cls) { const el = $("state"); el.textContent = text; el.className = cls; }
+
+function fmtPose(p) { return `(${p[0].toFixed(2)}, ${p[1].toFixed(2)}, ${p[2] >= 0 ? "+" : ""}${p[2].toFixed(2)})`; }
+
+function render() {
+  const f = frame;
+  if (!f) return;
+  setState(f.backend === "real" ? `real ${f.state}` : `sim ${f.state}`, f.state);
+  const parts = [`t ${f.t.toFixed(2)} s`, f.command];
+  if (f.truth) parts.push(`truth ${fmtPose(f.truth)}`);
+  parts.push(`odometry ${fmtPose(f.odometry)}`);
+  if (f.truth) parts.push(`error ${Math.hypot(f.odometry[0] - f.truth[0], f.odometry[1] - f.truth[1]).toFixed(3)} m`);
+  if (f.backend === "real") {
+    if (f.battery_v != null) parts.push(`battery ${f.battery_v.toFixed(2)} V`);
+    if (f.bumpers) parts.push(`bumpers 0b${f.bumpers.toString(2).padStart(4, "0")}`);
+    if (f.wheel_drop) parts.push("wheel drop");
+    if (f.detail) parts.push(f.detail);
+  }
+  $("status").textContent = parts.join("   ");
+  $("help").textContent = f.backend === "sim"
+    ? "Click the map, then WASD/arrows drive, Shift fast, P pause, R reset, O scan frame"
+    : "View only: the station never drives the real robot. R resets odometry.";
+  $("pause").disabled = f.backend !== "sim";
+  $("pause").textContent = f.state === "paused" ? "Resume" : "Pause";
+  dirty = true;
+}
+
+// ---- Drawing ----
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function draw() {
+  requestAnimationFrame(draw);
+  if (!dirty) return;
+  dirty = false;
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const f = frame;
+  if (!f || !bounds) return;
+
+  const margin = 24, sx = bounds.x1 - bounds.x0 || 1, sy = bounds.y1 - bounds.y0 || 1;
+  const scale = Math.min((w - 2 * margin) / sx, (h - 2 * margin) / sy);
+  const ox = (w - sx * scale) / 2 - bounds.x0 * scale, oy = (h + sy * scale) / 2 + bounds.y0 * scale;
+  const px = (x, y) => [ox + x * scale, oy - y * scale];
+  const line = (a, b, width, color) => {
+    ctx.beginPath(); ctx.moveTo(...px(a[0], a[1])); ctx.lineTo(...px(b[0], b[1]));
+    ctx.lineWidth = width; ctx.strokeStyle = color; ctx.stroke();
+  };
+
+  const grid = css("--grid");
+  for (let x = Math.floor(bounds.x0); x <= Math.ceil(bounds.x1); x++) line([x, bounds.y0], [x, bounds.y1], 1, grid);
+  for (let y = Math.floor(bounds.y0); y <= Math.ceil(bounds.y1); y++) line([bounds.x0, y], [bounds.x1, y], 1, grid);
+
+  const wall = css("--wall");
+  ctx.lineCap = "round";
+  for (const s of f.walls) line([s[0], s[1]], [s[2], s[3]], 3, wall);
+
+  const scanPose = (!f.truth || $("odomFrame").checked) ? f.odometry : f.truth;
+  const hits = worldHits(f, scanPose), from = scanPose;
+  const ray = css("--ray"), hit = css("--hit");
+  for (const p of hits) line(from, p, 1, ray);
+  ctx.fillStyle = hit;
+  for (const p of hits) { const [x, y] = px(p[0], p[1]); ctx.beginPath(); ctx.arc(x, y, 2.5, 0, 2 * Math.PI); ctx.fill(); }
+
+  const trail = (pts, color) => {
+    if (pts.length < 2) return;
+    ctx.beginPath(); ctx.moveTo(...px(pts[0][0], pts[0][1]));
+    for (const p of pts) ctx.lineTo(...px(p[0], p[1]));
+    ctx.lineWidth = 1.5; ctx.strokeStyle = color; ctx.stroke();
+  };
+  const truthColor = css("--truth"), odomColor = css("--odom");
+  trail(trails.truth, truthColor);
+  trail(trails.odom, odomColor);
+
+  const robot = (p, color, filled) => {
+    const [cx, cy] = px(p[0], p[1]), r = BODY_RADIUS_M * scale;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+    if (filled) { ctx.globalAlpha = 0.35; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1; }
+    ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.stroke();
+    line(p, [p[0] + Math.cos(p[2]) * BODY_RADIUS_M, p[1] + Math.sin(p[2]) * BODY_RADIUS_M], 2, color);
+  };
+  robot(f.odometry, odomColor, !f.truth);
+  if (f.truth) robot(f.truth, truthColor, true);
+}
+
+// ---- Controls ----
+const DRIVE_KEYS = {
+  forward: ["KeyW", "ArrowUp"], back: ["KeyS", "ArrowDown"],
+  left: ["KeyA", "ArrowLeft"], right: ["KeyD", "ArrowRight"], fast: ["ShiftLeft", "ShiftRight"],
+};
+const down = new Set();
+let sentKeys = "";
+
+function keyState() {
+  const k = {};
+  for (const [name, codes] of Object.entries(DRIVE_KEYS)) k[name] = codes.some((c) => down.has(c));
+  return k;
+}
+
+function sendKeys(force) {
+  const k = keyState(), s = JSON.stringify(k);
+  if (force || s !== sentKeys) { sentKeys = s; post({ op: "keys", ...k }); }
+}
+
+// The station treats keys as released if they aren't re-sent within 500 ms.
+setInterval(() => { if (down.size) sendKeys(true); }, 200);
+
+function typing(e) { return e.target instanceof HTMLInputElement && e.target.type === "text"; }
+
+window.addEventListener("keydown", (e) => {
+  if (typing(e) || e.metaKey || e.ctrlKey || e.altKey) return;
+  const drive = Object.values(DRIVE_KEYS).some((codes) => codes.includes(e.code));
+  if (drive) { e.preventDefault(); down.add(e.code); sendKeys(false); return; }
+  if (e.repeat) return;
+  if (e.code === "KeyP") $("pause").click();
+  else if (e.code === "KeyR") $("reset").click();
+  else if (e.code === "KeyO") { $("odomFrame").checked = !$("odomFrame").checked; dirty = true; }
+});
+window.addEventListener("keyup", (e) => { if (down.delete(e.code)) sendKeys(false); });
+window.addEventListener("blur", () => { down.clear(); sendKeys(false); });
+
+$("use").addEventListener("click", () => {
+  const kind = document.querySelector("input[name=backend]:checked").value;
+  if (kind === "real") {
+    const addr = $("addr").value.trim();
+    if (!addr) { $("addr").focus(); return; }
+    store.set("piAddr", addr);
+    post({ op: "use", backend: { kind: "real", addr } });
+  } else {
+    post({ op: "use", backend: { kind: "sim" } });
+  }
+  canvas.focus();
+});
+$("addr").addEventListener("focus", () => { document.querySelector("input[name=backend][value=real]").checked = true; });
+$("addr").addEventListener("keydown", (e) => { if (e.key === "Enter") $("use").click(); });
+$("pause").addEventListener("click", () => post({ op: "pause", paused: frame?.state !== "paused" }));
+$("reset").addEventListener("click", () => post({ op: "reset" }));
+$("odomFrame").addEventListener("change", () => { dirty = true; });
+window.addEventListener("resize", () => { dirty = true; });
+
+connect();
+requestAnimationFrame(draw);
+canvas.focus();
+</script>
+</body>
+</html>
