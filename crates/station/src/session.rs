@@ -34,6 +34,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A connected Pi that sends nothing for this long is reported as stalled.
 /// It covers the 2 s lidar spin-up after connecting.
 const STALL_AFTER: Duration = Duration::from_secs(4);
+/// How long to wait before reconnecting to a Pi that dropped or refused us.
+const RETRY_AFTER: Duration = Duration::from_secs(2);
 
 /// What the page can ask for.
 #[derive(Debug, Deserialize)]
@@ -181,7 +183,11 @@ enum Link {
     Connected {
         last_data: Instant,
     },
-    Closed(String),
+    /// The link dropped, and a reconnect is due once `RETRY_AFTER` passes.
+    Closed {
+        why: String,
+        at: Instant,
+    },
 }
 
 /// What the reader task reports.
@@ -203,8 +209,25 @@ impl RealRun {
     /// Connects in the background. The reader task owns the backend and only
     /// ever calls `recv` on it.
     fn connect(addr: String, config: &RobotConfig) -> Self {
+        let (events, reader) = Self::spawn_reader(addr.clone());
+        Self {
+            addr,
+            link: Link::Connecting,
+            readings: Readings::new(config, Pose2::default()),
+            events,
+            reader,
+        }
+    }
+
+    /// Tries again after a drop, keeping the readings so odometry carries on.
+    fn reconnect(&mut self) {
+        self.reader.abort();
+        (self.events, self.reader) = Self::spawn_reader(self.addr.clone());
+        self.link = Link::Connecting;
+    }
+
+    fn spawn_reader(target: String) -> (mpsc::Receiver<RealEvent>, JoinHandle<()>) {
         let (tx, events) = mpsc::channel(256);
-        let target = addr.clone();
         let reader = tokio::spawn(async move {
             let connect = tokio::time::timeout(CONNECT_TIMEOUT, RealBackend::connect(target));
             let mut robot = match connect.await {
@@ -233,13 +256,7 @@ impl RealRun {
             };
             let _ = tx.send(RealEvent::Closed(closed)).await;
         });
-        Self {
-            addr,
-            link: Link::Connecting,
-            readings: Readings::new(config, Pose2::default()),
-            events,
-            reader,
-        }
+        (events, reader)
     }
 }
 
@@ -343,8 +360,18 @@ impl Session {
                             }
                             real.readings.update(m, config)
                         }
-                        RealEvent::Closed(why) => real.link = Link::Closed(why),
+                        RealEvent::Closed(why) => {
+                            real.link = Link::Closed {
+                                why,
+                                at: Instant::now(),
+                            }
+                        }
                     }
+                }
+                if let Link::Closed { at, .. } = &real.link
+                    && at.elapsed() >= RETRY_AFTER
+                {
+                    real.reconnect();
                 }
                 Ok(())
             }
@@ -383,7 +410,7 @@ impl Session {
                         ),
                     ),
                     Link::Connected { .. } => ("connected", String::new()),
-                    Link::Closed(why) => ("disconnected", why.clone()),
+                    Link::Closed { why, .. } => ("disconnected", format!("{why}; retrying")),
                 };
                 let frame = json!({
                     "backend": "real",
