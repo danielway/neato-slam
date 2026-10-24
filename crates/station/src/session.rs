@@ -31,6 +31,9 @@ const MAX_STEP: Duration = Duration::from_millis(100);
 const KEYS_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long to wait for the Pi to accept a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A connected Pi that sends nothing for this long is reported as stalled.
+/// It covers the 2 s lidar spin-up after connecting.
+const STALL_AFTER: Duration = Duration::from_secs(4);
 
 /// What the page can ask for.
 #[derive(Debug, Deserialize)]
@@ -172,7 +175,12 @@ impl SimRun {
 
 enum Link {
     Connecting,
-    Connected,
+    /// TCP is up. The instant is when data last arrived, or when the link
+    /// came up if nothing has yet, so a link that carries no data can be told
+    /// apart from a live one.
+    Connected {
+        last_data: Instant,
+    },
     Closed(String),
 }
 
@@ -324,8 +332,17 @@ impl Session {
             Source::Real(real) => {
                 while let Ok(event) = real.events.try_recv() {
                     match event {
-                        RealEvent::Connected => real.link = Link::Connected,
-                        RealEvent::Msg(m) => real.readings.update(m, config),
+                        RealEvent::Connected => {
+                            real.link = Link::Connected {
+                                last_data: Instant::now(),
+                            }
+                        }
+                        RealEvent::Msg(m) => {
+                            if let Link::Connected { last_data } = &mut real.link {
+                                *last_data = Instant::now();
+                            }
+                            real.readings.update(m, config)
+                        }
                         RealEvent::Closed(why) => real.link = Link::Closed(why),
                     }
                 }
@@ -358,7 +375,14 @@ impl Session {
             Source::Real(real) => {
                 let (state, detail) = match &real.link {
                     Link::Connecting => ("connecting", String::new()),
-                    Link::Connected => ("connected", String::new()),
+                    Link::Connected { last_data } if last_data.elapsed() >= STALL_AFTER => (
+                        "stalled",
+                        format!(
+                            "connected, but no data for {:.0} s",
+                            last_data.elapsed().as_secs_f64()
+                        ),
+                    ),
+                    Link::Connected { .. } => ("connected", String::new()),
                     Link::Closed(why) => ("disconnected", why.clone()),
                 };
                 let frame = json!({

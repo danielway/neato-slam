@@ -63,7 +63,7 @@ Copy it over, which also needs the policy rule above, for port 22:
 
 ```sh
 scp target/aarch64-unknown-linux-musl/release/pi-node pi@192.168.1.50:
-ssh pi@192.168.1.50 ./pi-node --serial /dev/ttyACM0 --listen 0.0.0.0:7878
+ssh pi@192.168.1.50 ./pi-node --listen 0.0.0.0:7878
 ```
 
 If the sandbox can't reach the Pi over SSH, copy the binary out of the sandbox to the Mac and `scp` it from there.
@@ -90,10 +90,10 @@ The first build takes several minutes; later ones are quick.
 ## 4. Run pi-node on the Pi
 
 ```sh
-./pi-node --serial /dev/ttyACM0 --listen 0.0.0.0:7878
+./pi-node --listen 0.0.0.0:7878
 ```
 
-On start it prints the Neato's `GetVersion` reply and waits for the station. If it can't open the port, check `ls /dev/ttyACM*` and that your user is in the `dialout` group (`sudo usermod -aG dialout $USER`, then log in again).
+`--serial` defaults to `auto`, which finds the Neato under `/dev/serial/by-id/` or as the first `/dev/ttyACM*`. That matters because the robot sometimes drops off USB (when it sleeps, or on a marginal cable) and comes back under a new ttyACM number. `pi-node` notices the serial error, keeps the station connected, and reopens the robot when it reappears. On start it prints the Neato's `GetVersion` reply and waits for the station. If a new station connects while another is still connected, the new one takes over, so a dead connection can't block it. If it can't open the port, check `ls /dev/ttyACM*` and that your user is in the `dialout` group (`sudo usermod -aG dialout $USER`, then log in again).
 
 When the station connects (pick "real" on its page and enter the Pi's address, such as `192.168.1.50:7878`), `pi-node` spins up the lidar, waits 2 seconds for it to reach speed, then streams wheel positions and bumpers at 10 Hz and a scan at 5 Hz. When the station disconnects, it stops the lidar and waits for the next connection. A reply it can't parse is logged with its first few lines and skipped, which is the quickest way to spot a firmware that formats replies differently.
 

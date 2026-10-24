@@ -11,6 +11,27 @@ use neato::END_OF_RESPONSE;
 /// 360 lines.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Finds the Neato's serial port: the stable /dev/serial/by-id name when
+/// there is one, else the first /dev/ttyACM*. The ttyACM number changes
+/// when the robot drops off USB and comes back, so a fixed path goes stale.
+pub fn find_port() -> Option<String> {
+    let listed = |dir: &str, prefix: &str| -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .filter(|p| p.rsplit('/').next().is_some_and(|n| n.starts_with(prefix)))
+            .collect();
+        found.sort();
+        found
+    };
+    listed("/dev/serial/by-id", "")
+        .into_iter()
+        .chain(listed("/dev", "ttyACM"))
+        .next()
+}
+
 /// The Neato's USB serial port, one command and reply at a time.
 pub struct NeatoPort {
     file: File,
@@ -27,6 +48,7 @@ impl NeatoPort {
             .args([
                 "-F", path, "115200", "raw", "-echo", "min", "0", "time", "2",
             ])
+            .stderr(std::process::Stdio::null())
             .status()
             .context("running stty")?;
         if !status.success() {
