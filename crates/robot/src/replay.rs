@@ -1,36 +1,56 @@
 use std::collections::VecDeque;
 use std::io;
+use std::path::Path;
 
+use crate::log::{Entry, Recording};
 use crate::{Command, Msg, Pose2, RobotIo, Stamped};
 
 /// Plays back a recorded run, as fast as it is read. Pacing to the original
 /// timing is the caller's job, using the stamps.
 pub struct ReplayBackend {
-    messages: VecDeque<Stamped<Msg>>,
+    entries: VecDeque<Entry>,
+    truth: Option<Pose2>,
 }
 
 impl ReplayBackend {
-    /// Logs come in as lists until recording lands. The plan is MCAP files
-    /// with one channel per message type, one for commands sent, one for
-    /// ground truth when the source has it, and the run's `robot.toml` as
-    /// metadata, so sim and real runs look alike downstream.
+    /// Opens an MCAP log written by [`crate::log::LogWriter`].
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self::from_recording(Recording::read_file(path)?))
+    }
+
+    pub fn from_recording(recording: Recording) -> Self {
+        Self {
+            entries: recording.entries.into(),
+            truth: None,
+        }
+    }
+
     pub fn from_messages(messages: impl IntoIterator<Item = Stamped<Msg>>) -> Self {
         Self {
-            messages: messages.into_iter().collect(),
+            entries: messages.into_iter().map(Entry::Msg).collect(),
+            truth: None,
         }
     }
 }
 
 impl RobotIo for ReplayBackend {
     async fn recv(&mut self) -> io::Result<Option<Stamped<Msg>>> {
-        Ok(self.messages.pop_front())
+        while let Some(entry) = self.entries.pop_front() {
+            match entry {
+                Entry::Msg(m) => return Ok(Some(m)),
+                Entry::Truth { pose, .. } => self.truth = Some(pose),
+                Entry::Command { .. } => {}
+            }
+        }
+        Ok(None)
     }
 
     async fn send(&mut self, _command: Command) -> io::Result<()> {
         Ok(())
     }
 
+    /// The latest true pose recorded before the message last returned.
     fn ground_truth(&self) -> Option<Pose2> {
-        None
+        self.truth
     }
 }

@@ -4,7 +4,9 @@
 //! - `GET /` serves the page.
 //! - `GET /events` streams frames as server-sent events.
 //! - `POST /control` takes one JSON [`Control`].
+//! - `GET /recordings` lists the logs that can be replayed, as JSON.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
+use crate::recorder;
 use crate::session::Control;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -22,13 +25,15 @@ pub async fn serve(
     listener: TcpListener,
     controls: mpsc::Sender<Control>,
     frames: watch::Receiver<Arc<str>>,
+    recordings: PathBuf,
 ) -> Result<()> {
+    let recordings: Arc<Path> = recordings.into();
     loop {
         let (stream, _) = listener.accept().await?;
-        let (controls, frames) = (controls.clone(), frames.clone());
+        let (controls, frames, recordings) = (controls.clone(), frames.clone(), recordings.clone());
         tokio::spawn(async move {
             // A browser dropping a connection is routine, not worth a log line.
-            let _ = handle(stream, controls, frames).await;
+            let _ = handle(stream, controls, frames, &recordings).await;
         });
     }
 }
@@ -104,6 +109,7 @@ async fn handle(
     stream: TcpStream,
     controls: mpsc::Sender<Control>,
     mut frames: watch::Receiver<Arc<str>>,
+    recordings: &Path,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(req) = read_request(&mut reader).await? else {
@@ -121,6 +127,10 @@ async fn handle(
                 INDEX_HTML.as_bytes(),
             )
             .await
+        }
+        ("GET", "/recordings") => {
+            let list = serde_json::to_vec(&recorder::list(recordings))?;
+            respond(&mut stream, "200 OK", "application/json", &list).await
         }
         ("GET", "/events") => {
             stream

@@ -132,6 +132,16 @@ After rebuilding, run `systemctl --user restart pi-node`.
 
 The Pi's Wi-Fi power saving adds latency spikes that show up as stuttering scans. With NetworkManager, run `nmcli con modify "<connection>" 802-11-wireless.powersave 2`, which takes effect on the next reconnect. `sudo iw dev wlan0 set power_save off` applies it right away.
 
+## 5. Record a session
+
+With the station showing the real robot, click **Record**, do the run, and click **Stop**. The log goes into `recordings/` under the folder the station was started from, which in the sandbox is the repo folder, so it also shows up on the Mac if the sandbox shares that folder. Pick **Replay** and the recording to play it back. To check a recording from the command line:
+
+```sh
+cargo run --release -p station -- --replay recordings/<name>.mcap
+```
+
+It prints what the log holds, how many messages each stream has, and how many gaps in their sequence numbers (messages lost on the way, usually Wi-Fi). Recording never sends the robot anything, so the station stays view-only while it records.
+
 ## Safety
 
 Driving the real robot is off on both ends. The station never sends it a command, since the page's drive keys only reach the sim. `pi-node` never sends the Neato a drive command either: anything that arrives from the station is logged and dropped. It only uses `GetVersion`, `TestMode`, `SetLDSRotation`, `GetMotors`, `GetDigitalSensors` and `GetLDSScan`. Enabling driving later will be a deliberate change to `pi-node`, together with the 300 ms stop watchdog from the design.

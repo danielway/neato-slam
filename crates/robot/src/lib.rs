@@ -8,6 +8,7 @@
 
 mod config;
 mod io;
+pub mod log;
 #[cfg(feature = "net")]
 mod real;
 mod replay;

@@ -3,11 +3,19 @@
 //!
 //! The sim is stepped in wall-clock time and driven by the page's keys. The
 //! real robot is view-only: its messages are drawn, but this module never
-//! sends it a command, so the page can't move the drive motors.
+//! sends it a command, so the page can't move the drive motors. A replay
+//! plays a recorded log at its original pace, or faster.
+//!
+//! The sim or the real robot can be recorded while it is shown: everything
+//! it reports goes into a log in the recordings folder (see `recorder`), and
+//! for the sim, the commands it was given and its true pose too.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use robot::log::{self, Entry, Recording};
 use robot::{
     Command, Contacts, LidarScan, Msg, Pose2, RealBackend, RobotConfig, RobotIo, RobotStatus,
     Stamped,
@@ -19,6 +27,7 @@ use slam::odometry::WheelOdometry;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::recorder::{self, Recorder};
 use crate::teleop::{self, Keys};
 
 /// How often frames go out to the page.
@@ -36,6 +45,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALL_AFTER: Duration = Duration::from_secs(4);
 /// How long to wait before reconnecting to a Pi that dropped or refused us.
 const RETRY_AFTER: Duration = Duration::from_secs(2);
+/// A replay skips through quiet stretches longer than this, such as a
+/// dropped link or a restarted pi-node, whose stamps start over.
+const MAX_REPLAY_GAP_NS: u64 = 2_000_000_000;
+const SPEEDS: std::ops::RangeInclusive<f64> = 0.1..=20.0;
 
 /// What the page can ask for.
 #[derive(Debug, Deserialize)]
@@ -45,11 +58,15 @@ pub enum Control {
     Keys(Keys),
     /// Switch to another source.
     Use { backend: Backend },
-    /// Start the current source over: a fresh sim, or odometry back at the
-    /// origin on the real robot.
+    /// Start the current source over: a fresh sim, odometry back at the
+    /// origin on the real robot, or a replay from the top.
     Reset,
-    /// Freeze sim time.
+    /// Freeze sim or replay time.
     Pause { paused: bool },
+    /// Start or stop recording the sim or the real robot.
+    Record { on: bool },
+    /// Replay speed, as a multiple of the recorded pace.
+    Speed { speed: f64 },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +76,10 @@ pub enum Backend {
     /// `pi-node` at a host:port, view-only.
     Real {
         addr: String,
+    },
+    /// A log in the recordings folder, by file name.
+    Replay {
+        file: String,
     },
 }
 
@@ -159,19 +180,42 @@ impl SimRun {
         command: Command,
         step_ns: u64,
         config: &RobotConfig,
+        tape: &mut Tape,
     ) -> std::io::Result<()> {
         if command != self.command {
             self.robot.send(command).await?;
             self.command = command;
+            let t_ns = self.robot.sim().time_ns();
+            tape.put(|| Entry::Command { t_ns, command });
         }
         self.clock_ns += step_ns;
         while self.readings.t_ns < self.clock_ns {
             let Some(m) = self.robot.recv().await? else {
                 break;
             };
+            // Wheels come first from each physics step, when the sim's pose
+            // is that step's, so the truth goes in just ahead of them.
+            if matches!(m.msg, Msg::Wheels(_)) {
+                let pose = self
+                    .robot
+                    .ground_truth()
+                    .expect("the sim always knows its pose");
+                tape.put(|| Entry::Truth { t_ns: m.t_ns, pose });
+            }
+            tape.put(|| Entry::Msg(m.clone()));
             self.readings.update(m, config);
         }
         Ok(())
+    }
+
+    fn walls(&self) -> Vec<[f64; 4]> {
+        self.robot
+            .sim()
+            .world
+            .segments
+            .iter()
+            .map(|s| [s.a.0, s.a.1, s.b.0, s.b.1])
+            .collect()
     }
 }
 
@@ -266,9 +310,136 @@ impl Drop for RealRun {
     }
 }
 
+struct ReplayRun {
+    name: String,
+    recording: Arc<Recording>,
+    /// Each entry's place on the playback clock: its stamp relative to the
+    /// first, with long gaps cut short.
+    timeline: Vec<u64>,
+    /// The next entry to play.
+    next: usize,
+    clock_ns: u64,
+    speed: f64,
+    paused: bool,
+    readings: Readings,
+    truth: Option<Pose2>,
+    command: Option<Command>,
+    /// Walls of a sim recording's world.
+    walls: Value,
+}
+
+impl ReplayRun {
+    fn new(name: String, recording: Arc<Recording>, config: &RobotConfig, speed: f64) -> Self {
+        let mut timeline = Vec::with_capacity(recording.entries.len());
+        let mut last = None;
+        let mut at = 0u64;
+        for entry in &recording.entries {
+            let t = entry.t_ns();
+            if let Some(last) = last {
+                at += t.saturating_sub(last).min(MAX_REPLAY_GAP_NS);
+            }
+            last = Some(t);
+            timeline.push(at);
+        }
+        // Odometry starts where the truth does, when the log has it.
+        let start = recording
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Truth { pose, .. } => Some(*pose),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let walls = recording
+            .info
+            .get("world")
+            .and_then(|w| serde_json::from_str(w).ok())
+            .unwrap_or_else(|| json!([]));
+        Self {
+            name,
+            timeline,
+            next: 0,
+            clock_ns: 0,
+            speed,
+            paused: false,
+            readings: Readings::new(config, start),
+            truth: None,
+            command: None,
+            walls,
+            recording,
+        }
+    }
+
+    fn restart(&mut self, config: &RobotConfig) {
+        let paused = self.paused;
+        *self = Self::new(
+            self.name.clone(),
+            self.recording.clone(),
+            config,
+            self.speed,
+        );
+        self.paused = paused;
+    }
+
+    fn duration_ns(&self) -> u64 {
+        self.timeline.last().copied().unwrap_or(0)
+    }
+
+    fn ended(&self) -> bool {
+        self.next >= self.timeline.len()
+    }
+
+    fn advance(&mut self, elapsed: Duration, config: &RobotConfig) {
+        if !self.paused {
+            self.clock_ns += (elapsed.min(MAX_STEP).as_nanos() as f64 * self.speed) as u64;
+        }
+        while self.next < self.timeline.len() && self.timeline[self.next] <= self.clock_ns {
+            match &self.recording.entries[self.next] {
+                Entry::Msg(m) => self.readings.update(m.clone(), config),
+                Entry::Truth { pose, .. } => self.truth = Some(*pose),
+                Entry::Command { command, .. } => self.command = Some(*command),
+            }
+            self.next += 1;
+        }
+        self.clock_ns = self.clock_ns.min(self.duration_ns());
+    }
+}
+
 enum Source {
     Sim(SimRun),
     Real(RealRun),
+    Replay(ReplayRun),
+}
+
+/// The recording in progress, if any.
+#[derive(Default)]
+struct Tape {
+    recorder: Option<Recorder>,
+    /// Why the last recording failed, for the page.
+    error: Option<String>,
+}
+
+impl Tape {
+    /// Writes an entry if recording. The entry is only built when needed.
+    fn put(&mut self, entry: impl FnOnce() -> Entry) {
+        let Some(rec) = &mut self.recorder else {
+            return;
+        };
+        if let Err(e) = rec.write(&entry()) {
+            self.error = Some(format!("recording {} stopped: {e}", rec.name));
+            self.recorder = None;
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(rec) = self.recorder.take() {
+            let name = rec.name.clone();
+            match rec.finish() {
+                Ok(()) => println!("station: saved recording {name}"),
+                Err(e) => self.error = Some(format!("saving recording {name} failed: {e}")),
+            }
+        }
+    }
 }
 
 pub struct Session {
@@ -279,10 +450,17 @@ pub struct Session {
     run: u64,
     keys: Keys,
     keys_at: Instant,
+    /// Where recordings are written and replays are read from.
+    recordings: PathBuf,
+    tape: Tape,
+    /// The last thing that went wrong with a switch, for the page.
+    notice: Option<String>,
+    /// Replay speed, kept across replays.
+    speed: f64,
 }
 
 impl Session {
-    pub fn new(config: RobotConfig, start: Pose2) -> Self {
+    pub fn new(config: RobotConfig, start: Pose2, recordings: PathBuf) -> Self {
         Self {
             source: Source::Sim(SimRun::new(&config, start)),
             config,
@@ -290,6 +468,67 @@ impl Session {
             run: 0,
             keys: Keys::default(),
             keys_at: Instant::now(),
+            recordings,
+            tape: Tape::default(),
+            notice: None,
+            speed: 1.0,
+        }
+    }
+
+    fn open_replay(&self, file: &str) -> std::io::Result<ReplayRun> {
+        let path = recorder::path_of(&self.recordings, file)?;
+        let recording = Recording::read_file(&path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("reading {file}: {e}")))?;
+        Ok(ReplayRun::new(
+            file.to_owned(),
+            Arc::new(recording),
+            &self.config,
+            self.speed,
+        ))
+    }
+
+    fn start_recording(&mut self) {
+        let mut info = BTreeMap::new();
+        match self.config.to_toml_string() {
+            Ok(toml) => info.insert(log::ROBOT_TOML.to_owned(), toml),
+            Err(e) => return self.tape.error = Some(format!("couldn't save robot.toml: {e}")),
+        };
+        let source = match &self.source {
+            Source::Sim(sim) => {
+                info.insert("world".into(), json!(sim.walls()).to_string());
+                "sim"
+            }
+            Source::Real(real) => {
+                info.insert("addr".into(), real.addr.clone());
+                "real"
+            }
+            Source::Replay(_) => {
+                return self.tape.error = Some("a replay can't be recorded".into());
+            }
+        };
+        match Recorder::start(&self.recordings, source, info) {
+            Ok(rec) => {
+                println!(
+                    "station: recording to {}",
+                    self.recordings.join(&rec.name).display()
+                );
+                self.tape = Tape {
+                    recorder: Some(rec),
+                    error: None,
+                };
+                // The sim keeps its command until it changes, so say what it
+                // is now.
+                if let Source::Sim(sim) = &self.source {
+                    let (t_ns, command) = (sim.robot.sim().time_ns(), sim.command);
+                    self.tape.put(|| Entry::Command { t_ns, command });
+                }
+            }
+            Err(e) => {
+                self.tape.error = Some(format!(
+                    "couldn't record in {}: {e}",
+                    self.recordings.display()
+                ))
+            }
         }
     }
 
@@ -300,26 +539,50 @@ impl Session {
                 self.keys_at = Instant::now();
             }
             Control::Use { backend } => {
-                self.source = match backend {
+                let source = match backend {
                     Backend::Sim => Source::Sim(SimRun::new(&self.config, self.start)),
                     Backend::Real { addr } => {
                         Source::Real(RealRun::connect(addr.trim().to_owned(), &self.config))
                     }
+                    Backend::Replay { file } => match self.open_replay(&file) {
+                        Ok(replay) => Source::Replay(replay),
+                        Err(e) => return self.notice = Some(e.to_string()),
+                    },
                 };
+                self.tape.stop();
+                self.notice = None;
+                self.source = source;
                 self.run += 1;
             }
             Control::Reset => {
                 match &mut self.source {
-                    Source::Sim(sim) => *sim = SimRun::new(&self.config, self.start),
+                    Source::Sim(sim) => {
+                        // A fresh sim starts its clock over, so it gets a
+                        // fresh recording too.
+                        self.tape.stop();
+                        *sim = SimRun::new(&self.config, self.start)
+                    }
                     Source::Real(real) => {
                         real.readings = Readings::new(&self.config, Pose2::default())
                     }
+                    Source::Replay(replay) => replay.restart(&self.config),
                 }
                 self.run += 1;
             }
-            Control::Pause { paused } => {
-                if let Source::Sim(sim) = &mut self.source {
-                    sim.paused = paused;
+            Control::Pause { paused } => match &mut self.source {
+                Source::Sim(sim) => sim.paused = paused,
+                Source::Replay(replay) => replay.paused = paused,
+                Source::Real(_) => {}
+            },
+            Control::Record { on: true } if self.tape.recorder.is_none() => self.start_recording(),
+            Control::Record { on: false } => self.tape.stop(),
+            Control::Record { .. } => {}
+            Control::Speed { speed } => {
+                if speed.is_finite() {
+                    self.speed = speed.clamp(*SPEEDS.start(), *SPEEDS.end());
+                    if let Source::Replay(replay) = &mut self.source {
+                        replay.speed = self.speed;
+                    }
                 }
             }
         }
@@ -336,6 +599,7 @@ impl Session {
     async fn tick(&mut self, elapsed: Duration) -> std::io::Result<()> {
         let keys = self.held_keys();
         let config = &self.config;
+        let tape = &mut self.tape;
         match &mut self.source {
             Source::Sim(sim) => {
                 let (command, step) = if sim.paused {
@@ -344,7 +608,8 @@ impl Session {
                     let max = config.drive.max_wheel_speed_mm_s;
                     (teleop::command(keys, max), elapsed.min(MAX_STEP))
                 };
-                sim.advance(command, step.as_nanos() as u64, config).await
+                sim.advance(command, step.as_nanos() as u64, config, tape)
+                    .await
             }
             Source::Real(real) => {
                 while let Ok(event) = real.events.try_recv() {
@@ -358,6 +623,7 @@ impl Session {
                             if let Link::Connected { last_data } = &mut real.link {
                                 *last_data = Instant::now();
                             }
+                            tape.put(|| Entry::Msg(m.clone()));
                             real.readings.update(m, config)
                         }
                         RealEvent::Closed(why) => {
@@ -375,6 +641,10 @@ impl Session {
                 }
                 Ok(())
             }
+            Source::Replay(replay) => {
+                replay.advance(elapsed, config);
+                Ok(())
+            }
         }
     }
 
@@ -382,20 +652,12 @@ impl Session {
         let pose = |p: Pose2| json!([round(p.x), round(p.y), round(p.theta)]);
         let (readings, mut frame) = match &self.source {
             Source::Sim(sim) => {
-                let walls: Vec<_> = sim
-                    .robot
-                    .sim()
-                    .world
-                    .segments
-                    .iter()
-                    .map(|s| [s.a.0, s.a.1, s.b.0, s.b.1])
-                    .collect();
                 let frame = json!({
                     "backend": "sim",
                     "state": if sim.paused { "paused" } else { "running" },
                     "command": describe(sim.command),
                     "truth": pose(sim.robot.ground_truth().expect("the sim always knows its pose")),
-                    "walls": walls,
+                    "walls": sim.walls(),
                 });
                 (&sim.readings, frame)
             }
@@ -423,6 +685,35 @@ impl Session {
                 });
                 (&real.readings, frame)
             }
+            Source::Replay(replay) => {
+                let state = if replay.ended() {
+                    "ended"
+                } else if replay.paused {
+                    "paused"
+                } else {
+                    "playing"
+                };
+                let mut detail = format!(
+                    "{}  {:.1} / {:.1} s",
+                    replay.name,
+                    replay.clock_ns as f64 * 1e-9,
+                    replay.duration_ns() as f64 * 1e-9,
+                );
+                if replay.recording.truncated {
+                    detail.push_str(" (cut short)");
+                }
+                let frame = json!({
+                    "backend": "replay",
+                    "file": replay.name,
+                    "state": state,
+                    "detail": detail,
+                    "command": replay.command.map_or_else(|| "replay".to_owned(), describe),
+                    "truth": replay.truth.map(pose),
+                    "walls": replay.walls,
+                    "speed": replay.speed,
+                });
+                (&replay.readings, frame)
+            }
         };
         let hits: Vec<_> = readings
             .hits
@@ -442,6 +733,12 @@ impl Session {
                 "charging": s.charging,
                 "external_power": s.external_power,
             })),
+            "recording": self.tape.recorder.as_ref().map(|r| json!({
+                "file": r.name,
+                "seconds": r.started.elapsed().as_secs_f64().round(),
+                "entries": r.entries,
+            })),
+            "notice": self.tape.error.as_ref().or(self.notice.as_ref()),
         });
         if let (Value::Object(frame), Value::Object(extra)) = (&mut frame, extra) {
             frame.extend(extra);
@@ -524,7 +821,11 @@ mod tests {
 
     #[tokio::test]
     async fn sim_drives_from_keys_and_stops_when_they_go_stale() {
-        let mut session = Session::new(config(), Pose2::new(1.0, 1.0, 0.0));
+        let mut session = Session::new(
+            config(),
+            Pose2::new(1.0, 1.0, 0.0),
+            PathBuf::from("recordings"),
+        );
         session.control(Control::Keys(Keys {
             forward: true,
             ..Keys::default()
@@ -545,6 +846,130 @@ mod tests {
         assert_eq!(sim.command, Command::Stop);
     }
 
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("station-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_recorded_sim_drive_replays_with_its_truth() {
+        let dir = scratch_dir("sim");
+        let mut session = Session::new(config(), Pose2::new(1.0, 1.0, 0.0), dir.clone());
+        session.control(Control::Record { on: true });
+        assert!(session.tape.recorder.is_some(), "{:?}", session.tape.error);
+        for _ in 0..20 {
+            session.control(Control::Keys(Keys {
+                forward: true,
+                left: true,
+                ..Keys::default()
+            }));
+            session.tick(Duration::from_millis(100)).await.unwrap();
+        }
+        let live = session.frame();
+        session.control(Control::Record { on: false });
+        assert!(session.tape.recorder.is_none());
+
+        let logs = recorder::list(&dir);
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].name.ends_with("-sim.mcap"), "{}", logs[0].name);
+        session.control(Control::Use {
+            backend: Backend::Replay {
+                file: logs[0].name.clone(),
+            },
+        });
+        session.control(Control::Speed { speed: 20.0 });
+        for _ in 0..10 {
+            session.tick(Duration::from_millis(100)).await.unwrap();
+        }
+        let replayed = session.frame();
+        assert_eq!(replayed["backend"], "replay", "{replayed}");
+        assert_eq!(replayed["state"], "ended");
+        assert_eq!(replayed["truth"], live["truth"]);
+        // Replayed odometry starts from the first recorded truth, so with
+        // the sim's perfect wheels it lands on the truth.
+        for i in 0..3 {
+            let (odo, truth) = (&replayed["odometry"][i], &replayed["truth"][i]);
+            let err = (odo.as_f64().unwrap() - truth.as_f64().unwrap()).abs();
+            assert!(err < 0.005, "odometry {odo} vs truth {truth}");
+        }
+        assert_eq!(replayed["walls"], json!(live["walls"]));
+        assert!(replayed["command"].as_str().unwrap().starts_with("wheels"));
+
+        // Recording a replay is refused, and says why.
+        session.control(Control::Record { on: true });
+        assert!(session.tape.recorder.is_none());
+        assert!(session.frame()["notice"].is_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_refuses_paths_outside_the_folder() {
+        let dir = scratch_dir("paths");
+        let mut session = Session::new(config(), Pose2::default(), dir);
+        session.control(Control::Use {
+            backend: Backend::Replay {
+                file: "../robot.toml".into(),
+            },
+        });
+        assert!(matches!(session.source, Source::Sim(_)));
+        assert!(session.frame()["notice"].is_string());
+    }
+
+    #[tokio::test]
+    async fn records_the_real_robot_without_sending_it_anything() {
+        use robot::wire;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = scratch_dir("real");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut session = Session::new(config(), Pose2::default(), dir.clone());
+        session.control(Control::Use {
+            backend: Backend::Real { addr },
+        });
+        session.control(Control::Record { on: true });
+        let (mut pi, _) = listener.accept().await.unwrap();
+        for seq in 0..3 {
+            let m = Stamped {
+                t_ns: 1_000 + seq as u64,
+                seq,
+                msg: Msg::Wheels(robot::WheelPositions {
+                    left_mm: seq as i64,
+                    right_mm: 0,
+                }),
+            };
+            pi.write_all(&wire::encode_frame(&m).unwrap())
+                .await
+                .unwrap();
+        }
+        for _ in 0..10 {
+            session.tick(FRAME_PERIOD).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        session.control(Control::Record { on: false });
+
+        let logs = recorder::list(&dir);
+        let rec = Recording::read_file(dir.join(&logs[0].name)).unwrap();
+        assert!(!rec.truncated);
+        assert_eq!(rec.info["source"], "real");
+        assert!(rec.info.contains_key(log::ROBOT_TOML));
+        assert_eq!(rec.entries.len(), 3);
+        assert!(rec.entries.iter().all(|e| matches!(e, Entry::Msg(_))));
+
+        session.control(Control::Use {
+            backend: Backend::Sim,
+        });
+        let mut buf = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(1), pi.read_to_end(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "station sent {buf:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn real_robot_never_receives_commands() {
         use robot::wire;
@@ -553,7 +978,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let mut session = Session::new(config(), Pose2::default());
+        let mut session = Session::new(config(), Pose2::default(), PathBuf::from("recordings"));
         session.control(Control::Use {
             backend: Backend::Real { addr },
         });
