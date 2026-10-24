@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use robot::{Contacts, LidarScan, WheelPositions};
+use robot::{Contacts, LidarScan, RobotStatus, WheelPositions};
 
 /// Marks the end of each response.
 pub const END_OF_RESPONSE: char = '\u{1a}';
@@ -24,6 +24,7 @@ pub mod cmd {
     pub const GET_MOTORS: &str = "GetMotors";
     pub const GET_DIGITAL_SENSORS: &str = "GetDigitalSensors";
     pub const GET_VERSION: &str = "GetVersion";
+    pub const GET_CHARGER: &str = "GetCharger";
 
     /// Every fixed command pi-node sends, for recognising stale echoes.
     pub const ALL: &[&str] = &[
@@ -35,6 +36,7 @@ pub mod cmd {
         GET_MOTORS,
         GET_DIGITAL_SENSORS,
         GET_VERSION,
+        GET_CHARGER,
     ];
 
     /// Drives each wheel a distance in mm at up to `speed_mm_s`. A zero
@@ -187,6 +189,19 @@ pub fn parse_digital_sensors(response: &str) -> Result<Contacts, ParseError> {
     })
 }
 
+/// Parses `GetCharger`.
+pub fn parse_charger(response: &str) -> Result<RobotStatus, ParseError> {
+    let flag = |field: &'static str| -> Result<bool, ParseError> {
+        Ok(parse_num::<u8>(field, lookup(response, field)?)? != 0)
+    };
+    Ok(RobotStatus {
+        battery_v: parse_num("VBattV", lookup(response, "VBattV")?)?,
+        fuel_percent: parse_num("FuelPercent", lookup(response, "FuelPercent")?)?,
+        charging: flag("ChargingActive")?,
+        external_power: flag("ExtPwrPresent")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +280,17 @@ mod tests {
             cmd::wheel_speeds(100.0, -50.0, 0.5),
             "SetMotor LWheelDist 50 RWheelDist -25 Speed 100"
         );
+    }
+
+    #[test]
+    fn charger_parses() {
+        let reply = "GetCharger\r\nLabel,Value\r\nFuelPercent,83\r\nBatteryOverTemp,0\r\n\
+            ChargingActive,1\r\nChargingEnabled,1\r\nExtPwrPresent,1\r\n\
+            BattTempCAvg[0],27\r\nVBattV,15.96\r\nVExtV,23.10\r\n\u{1a}";
+        let s = parse_charger(reply).unwrap();
+        assert_eq!(s.fuel_percent, 83);
+        assert!((s.battery_v - 15.96).abs() < 1e-4);
+        assert!(s.charging);
+        assert!(s.external_power);
     }
 }

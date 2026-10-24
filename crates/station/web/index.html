@@ -144,7 +144,11 @@ function render() {
   parts.push(`odometry ${fmtPose(f.odometry)}`);
   if (f.truth) parts.push(`error ${Math.hypot(f.odometry[0] - f.truth[0], f.odometry[1] - f.truth[1]).toFixed(3)} m`);
   if (f.backend === "real") {
-    if (f.battery_v != null) parts.push(`battery ${f.battery_v.toFixed(2)} V`);
+    if (f.battery) {
+      const b = f.battery;
+      const power = b.charging ? ", charging" : b.external_power ? ", on power" : "";
+      parts.push(`battery ${b.percent}% (${b.v.toFixed(2)} V${power})`);
+    }
     if (f.bumpers) parts.push(`bumpers 0b${f.bumpers.toString(2).padStart(4, "0")}`);
     if (f.wheel_drop) parts.push("wheel drop");
     if (f.detail) parts.push(f.detail);

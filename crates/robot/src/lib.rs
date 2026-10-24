@@ -84,10 +84,15 @@ impl Contacts {
     }
 }
 
+/// Battery and charger state.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RobotStatus {
     pub battery_v: f32,
-    pub motors_enabled: bool,
+    /// The robot's own estimate of remaining charge, 0 to 100.
+    pub fuel_percent: u8,
+    pub charging: bool,
+    /// On the dock or plugged in.
+    pub external_power: bool,
 }
 
 /// Commands from the desktop to the robot.

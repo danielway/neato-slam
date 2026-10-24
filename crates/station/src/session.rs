@@ -409,7 +409,12 @@ impl Session {
             "hits": hits,
             "bumpers": readings.contacts.bumpers,
             "wheel_drop": readings.contacts.wheel_drop,
-            "battery_v": readings.status.map(|s| s.battery_v),
+            "battery": readings.status.map(|s| json!({
+                "v": s.battery_v,
+                "percent": s.fuel_percent,
+                "charging": s.charging,
+                "external_power": s.external_power,
+            })),
         });
         if let (Value::Object(frame), Value::Object(extra)) = (&mut frame, extra) {
             frame.extend(extra);

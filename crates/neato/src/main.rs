@@ -2,7 +2,7 @@
 //!
 //! It opens the Neato's USB serial port and serves the most recent station
 //! connection. While one is connected it spins the lidar and streams wheel
-//! positions, bumpers and scans to it, each stamped with the Pi's monotonic
+//! positions, bumpers, scans and battery state to it, each stamped with the Pi's monotonic
 //! clock when it was read.
 //!
 //! The Neato drops off USB now and then (when it sleeps, or on a marginal
@@ -33,9 +33,11 @@ use crate::port::NeatoPort;
 
 const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878]";
 
-/// Wheels and bumpers are polled every tick, the lidar every other tick.
+/// Wheels and bumpers are polled every tick, the lidar every other tick and
+/// the battery once a second.
 const TICK: Duration = Duration::from_millis(100);
 const SCAN_EVERY_TICKS: u32 = 2;
+const CHARGER_EVERY_TICKS: u32 = 10;
 /// Time for the lidar to reach speed after it is switched on.
 const LDS_SPIN_UP: Duration = Duration::from_secs(2);
 /// How often to look for the Neato while it's missing.
@@ -254,8 +256,11 @@ fn serve(
         let started = Instant::now();
         // While the robot is missing, keep the station and keep looking.
         if robot.try_open() && robot.lidar_up() {
-            let with_scan = tick % SCAN_EVERY_TICKS == 0;
-            if let Err(e) = poll_once(robot, &mut stream, clock, &mut seq, with_scan) {
+            let polls = Polls {
+                scan: tick % SCAN_EVERY_TICKS == 0,
+                charger: tick % CHARGER_EVERY_TICKS == 0,
+            };
+            if let Err(e) = poll_once(robot, &mut stream, clock, &mut seq, polls) {
                 break Err(e);
             }
             tick = tick.wrapping_add(1);
@@ -274,6 +279,13 @@ struct Seqs {
     wheels: u32,
     contacts: u32,
     lidar: u32,
+    status: u32,
+}
+
+/// The slower queries to include in a round.
+struct Polls {
+    scan: bool,
+    charger: bool,
 }
 
 fn next(seq: &mut u32) -> u32 {
@@ -290,9 +302,9 @@ fn poll_once(
     stream: &mut TcpStream,
     clock: Instant,
     seq: &mut Seqs,
-    with_scan: bool,
+    polls: Polls,
 ) -> Result<()> {
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(4);
 
     let t = stamp(clock);
     if let Some(reply) = robot.query(cmd::GET_MOTORS) {
@@ -318,7 +330,7 @@ fn poll_once(
         }
     }
 
-    if with_scan {
+    if polls.scan {
         let t = stamp(clock);
         if let Some(reply) = robot.query(cmd::GET_LDS_SCAN) {
             match neato::parse_lds_scan(&reply) {
@@ -328,6 +340,20 @@ fn poll_once(
                     msg: Msg::Lidar(s),
                 }),
                 Err(e) => log_bad_reply(cmd::GET_LDS_SCAN, &e, &reply),
+            }
+        }
+    }
+
+    if polls.charger {
+        let t = stamp(clock);
+        if let Some(reply) = robot.query(cmd::GET_CHARGER) {
+            match neato::parse_charger(&reply) {
+                Ok(s) => out.push(Stamped {
+                    t_ns: t,
+                    seq: next(&mut seq.status),
+                    msg: Msg::Status(s),
+                }),
+                Err(e) => log_bad_reply(cmd::GET_CHARGER, &e, &reply),
             }
         }
     }
