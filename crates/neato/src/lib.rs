@@ -23,6 +23,7 @@ pub mod cmd {
     pub const GET_LDS_SCAN: &str = "GetLDSScan";
     pub const GET_MOTORS: &str = "GetMotors";
     pub const GET_DIGITAL_SENSORS: &str = "GetDigitalSensors";
+    pub const GET_VERSION: &str = "GetVersion";
 
     /// Drives each wheel a distance in mm at up to `speed_mm_s`. A zero
     /// distance on both wheels stops the robot.

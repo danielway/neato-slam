@@ -42,8 +42,6 @@ nc -vz 192.168.1.50 7878
 
 ## 3. Cross-compile pi-node for the Pi
 
-`pi-node` is still a stub that exits with "not implemented yet", but it already cross-compiles, so the toolchain can be set up now.
-
 The Pi 3 Model B v1.2 has a 64-bit Cortex-A53. With a 64-bit Raspberry Pi OS, build a static aarch64 musl binary, which runs on any 64-bit Pi OS without matching its glibc. Zig serves as the cross linker, so no ARM toolchain is needed, and the same steps work in an x86_64 or an arm64 sandbox. One-time setup, in the sandbox:
 
 ```sh
@@ -70,6 +68,18 @@ ssh pi@192.168.1.50 ./pi-node --serial /dev/ttyACM0 --listen 0.0.0.0:7878
 
 If the sandbox can't reach the Pi over SSH, copy the binary out of the sandbox to the Mac and `scp` it from there.
 
+## 4. Run pi-node on the Pi
+
+```sh
+./pi-node --serial /dev/ttyACM0 --listen 0.0.0.0:7878
+```
+
+On start it prints the Neato's `GetVersion` reply and waits for the station. If it can't open the port, check `ls /dev/ttyACM*` and that your user is in the `dialout` group (`sudo usermod -aG dialout $USER`, then log in again).
+
+When the station connects (pick "real" on its page and enter the Pi's address, such as `192.168.1.50:7878`), `pi-node` spins up the lidar, waits 2 seconds for it to reach speed, then streams wheel positions and bumpers at 10 Hz and a scan at 5 Hz. When the station disconnects, it stops the lidar and waits for the next connection. A reply it can't parse is logged with its first few lines and skipped, which is the quickest way to spot a firmware that formats replies differently.
+
+Stopping `pi-node` with Ctrl-C while a station is connected can leave the lidar spinning. Disconnecting the station first stops it, and so does unplugging USB or power-cycling the robot.
+
 ## Safety
 
-The station never sends the real robot a command: the page's drive keys only reach the sim. Driving the real robot stays off until it is deliberately enabled, and `pi-node` is designed to stop the motors if no command arrives within 300 ms or the connection drops.
+Driving the real robot is off on both ends. The station never sends it a command, since the page's drive keys only reach the sim. `pi-node` never sends the Neato a drive command either: anything that arrives from the station is logged and dropped. It only uses `GetVersion`, `TestMode`, `SetLDSRotation`, `GetMotors`, `GetDigitalSensors` and `GetLDSScan`. Enabling driving later will be a deliberate change to `pi-node`, together with the 300 ms stop watchdog from the design.
