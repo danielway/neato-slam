@@ -11,8 +11,7 @@ max_wheel_speed_mm_s = 300.0 # TODO: confirm against the model's SetMotor limit
 [lidar]
 x_m = -0.0984     # measured 3 7/8" behind the wheel axle midpoint
 y_m = 0.0
-theta_rad = 0.0   # checked: a box in front shows up ahead
-                  # TODO: confirm angles run counterclockwise (box on the left shows left)
+theta_rad = 0.0   # checked: angle 0 points forward and angles run counterclockwise
 beams = 360
 min_range_m = 0.06
 max_range_m = 5.0
