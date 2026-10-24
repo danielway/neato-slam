@@ -95,9 +95,42 @@ The first build takes several minutes; later ones are quick.
 
 `--serial` defaults to `auto`, which finds the Neato under `/dev/serial/by-id/` or as the first `/dev/ttyACM*`. That matters because the robot sometimes drops off USB (when it sleeps, or on a marginal cable) and comes back under a new ttyACM number. `pi-node` notices the serial error, keeps the station connected, and reopens the robot when it reappears. On start it prints the Neato's `GetVersion` reply and waits for the station. If a new station connects while another is still connected, the new one takes over, so a dead connection can't block it. If it can't open the port, check `ls /dev/ttyACM*` and that your user is in the `dialout` group (`sudo usermod -aG dialout $USER`, then log in again).
 
-When the station connects (pick "real" on its page and enter the Pi's address, such as `192.168.1.50:7878`), `pi-node` spins up the lidar, waits 2 seconds for it to reach speed, then streams wheel positions and bumpers at 10 Hz and a scan at 5 Hz. When the station disconnects, it stops the lidar and waits for the next connection. A reply it can't parse is logged with its first few lines and skipped, which is the quickest way to spot a firmware that formats replies differently.
+When the station connects (pick "real" on its page and enter the Pi's address, such as `192.168.1.50:7878`, or `<hostname>.local:7878`, which keeps working if DHCP gives the Pi a new address), `pi-node` spins up the lidar, waits 2 seconds for it to reach speed, then streams wheel positions and bumpers at 10 Hz, a scan at 5 Hz and the battery state at 1 Hz. If the link drops, the station retries every 2 seconds on its own. When the station disconnects, it stops the lidar and waits for the next connection. A reply it can't parse is logged with its first few lines and skipped, which is the quickest way to spot a firmware that formats replies differently.
 
 Stopping `pi-node` with Ctrl-C while a station is connected can leave the lidar spinning. Disconnecting the station first stops it, and so does unplugging USB or power-cycling the robot.
+
+### Start it on boot
+
+A systemd user service keeps `pi-node` running across reboots and crashes, with no sudo needed. Create `~/.config/systemd/user/pi-node.service`:
+
+```ini
+[Unit]
+Description=Neato bridge for the SLAM station
+After=network-online.target
+
+[Service]
+ExecStart=%h/neato-slam/target/release/pi-node --listen 0.0.0.0:7878
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable it, and enable lingering so it starts without anyone logging in:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now pi-node
+loginctl enable-linger $USER
+journalctl --user -u pi-node -f   # follow its log
+```
+
+After rebuilding, run `systemctl --user restart pi-node`.
+
+### Turn off Wi-Fi power saving
+
+The Pi's Wi-Fi power saving adds latency spikes that show up as stuttering scans. With NetworkManager, run `nmcli con modify "<connection>" 802-11-wireless.powersave 2`, which takes effect on the next reconnect. `sudo iw dev wlan0 set power_save off` applies it right away.
 
 ## Safety
 
