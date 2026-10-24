@@ -52,8 +52,14 @@ fn main() -> Result<()> {
     let mut neato = NeatoPort::open(&serial)?;
     let version = neato.query(cmd::GET_VERSION)?;
     eprintln!("connected to the Neato on {serial}");
-    for line in version.lines().filter(|l| !l.trim().is_empty()).take(12) {
-        eprintln!("  {}", line.trim());
+    for line in version.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Connected models report their Wi-Fi setup password here; keep it
+        // out of logs.
+        if line.to_ascii_lowercase().starts_with("appassword") {
+            eprintln!("  APPassword,<hidden>");
+        } else {
+            eprintln!("  {line}");
+        }
     }
     neato.query(cmd::TEST_MODE_ON)?;
 
