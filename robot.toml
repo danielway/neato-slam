@@ -1,16 +1,18 @@
 # Geometry and sensor parameters for the robot, read by the station, the
 # simulator and SLAM. Every recorded log embeds a copy.
 # Values marked TODO are placeholders until measured on the real Neato.
+# Robot origin: midway between the two drive wheels.
 # Robot frame: x forward, y left, angles counterclockwise in radians.
 
 [drive]
-wheel_base_m = 0.24          # TODO: measure wheel centre to wheel centre
+wheel_base_m = 0.2445        # measured 9 5/8" tread centre to tread centre
 max_wheel_speed_mm_s = 300.0 # TODO: confirm against the model's SetMotor limit
 
 [lidar]
-x_m = -0.09       # TODO: measure the LDS turret position
+x_m = -0.0984     # measured 3 7/8" behind the wheel axle midpoint
 y_m = 0.0
-theta_rad = 0.0   # TODO: confirm which way angle 0 of GetLDSScan points
+theta_rad = 0.0   # checked: a box in front shows up ahead
+                  # TODO: confirm angles run counterclockwise (box on the left shows left)
 beams = 360
 min_range_m = 0.06
 max_range_m = 5.0
