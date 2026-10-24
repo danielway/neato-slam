@@ -68,6 +68,25 @@ ssh pi@192.168.1.50 ./pi-node --serial /dev/ttyACM0 --listen 0.0.0.0:7878
 
 If the sandbox can't reach the Pi over SSH, copy the binary out of the sandbox to the Mac and `scp` it from there.
 
+### Or build it on the Pi
+
+Building on the Pi skips cross-compiling and copying. `pi-node` leaves out the `robot` crate's `net` feature, so the Pi compiles about 18 small crates and no tokio. The repo is public, so cloning needs internet but no GitHub credentials. One-time setup on the Pi:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+git clone https://github.com/danielway/neato-slam
+```
+
+Then build, with `--locked` so the Pi uses exactly the committed `Cargo.lock`, and `-j 2` to stay within the Pi 3B's 1 GB of RAM:
+
+```sh
+cd neato-slam && git pull --ff-only
+cargo build --release --locked -j 2 -p neato --bin pi-node
+# -> target/release/pi-node
+```
+
+The first build takes several minutes; later ones are quick.
+
 ## 4. Run pi-node on the Pi
 
 ```sh

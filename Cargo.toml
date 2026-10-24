@@ -9,7 +9,7 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
-robot = { path = "crates/robot" }
+robot = { path = "crates/robot", default-features = false }
 sim = { path = "crates/sim" }
 slam = { path = "crates/slam" }
 

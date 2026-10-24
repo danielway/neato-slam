@@ -8,12 +8,14 @@
 
 mod config;
 mod io;
+#[cfg(feature = "net")]
 mod real;
 mod replay;
 pub mod wire;
 
 pub use config::{DriveConfig, LidarConfig, RobotConfig};
 pub use io::RobotIo;
+#[cfg(feature = "net")]
 pub use real::RealBackend;
 pub use replay::ReplayBackend;
 

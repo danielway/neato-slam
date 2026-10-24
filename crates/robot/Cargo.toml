@@ -6,8 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# The TCP client for pi-node. pi-node itself leaves it off, so the Pi build
+# skips tokio.
+net = ["dep:tokio"]
+
 [dependencies]
 postcard.workspace = true
 serde.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 toml.workspace = true
