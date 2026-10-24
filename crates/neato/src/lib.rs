@@ -25,6 +25,18 @@ pub mod cmd {
     pub const GET_DIGITAL_SENSORS: &str = "GetDigitalSensors";
     pub const GET_VERSION: &str = "GetVersion";
 
+    /// Every fixed command pi-node sends, for recognising stale echoes.
+    pub const ALL: &[&str] = &[
+        TEST_MODE_ON,
+        TEST_MODE_OFF,
+        LDS_ON,
+        LDS_OFF,
+        GET_LDS_SCAN,
+        GET_MOTORS,
+        GET_DIGITAL_SENSORS,
+        GET_VERSION,
+    ];
+
     /// Drives each wheel a distance in mm at up to `speed_mm_s`. A zero
     /// distance on both wheels stops the robot.
     pub fn set_motor(left_mm: i32, right_mm: i32, speed_mm_s: u32) -> String {
@@ -42,6 +54,22 @@ pub mod cmd {
             speed.round() as u32,
         )
     }
+}
+
+/// Whether a reply belongs to `command`. The Neato echoes each command as
+/// the first line of its reply, so a reply that echoes a different command
+/// is left over from an earlier exchange and must be skipped, or every reply
+/// after it would be read against the wrong command.
+pub fn echoes_other_command(command: &str, reply: &str) -> bool {
+    let first = reply
+        .lines()
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == END_OF_RESPONSE))
+        .find(|l| !l.is_empty());
+    // Only the echo of another command we send counts. Anything else, such
+    // as a table or an error line, belongs to this command.
+    first.is_some_and(|line| {
+        !line.eq_ignore_ascii_case(command) && cmd::ALL.iter().any(|c| line.eq_ignore_ascii_case(c))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +238,25 @@ mod tests {
         let c = parse_digital_sensors(response).unwrap();
         assert_eq!(c.bumpers, Contacts::LEFT_FRONT | Contacts::RIGHT_FRONT);
         assert_eq!(c.wheel_drop, Contacts::LEFT_WHEEL);
+    }
+
+    #[test]
+    fn stale_replies_are_recognised_by_their_echo() {
+        let motors = "GetMotors\r\nParameter,Value\r\nLeftWheel_PositionInMM,1\r\n";
+        assert!(!echoes_other_command("GetMotors", motors));
+        assert!(!echoes_other_command("getmotors", motors));
+        assert!(echoes_other_command("GetDigitalSensors", motors));
+        // No echo at all: a table straight away still counts as ours.
+        assert!(!echoes_other_command(
+            "GetMotors",
+            "Parameter,Value\r\nLeftWheel_PositionInMM,1\r\n"
+        ));
+        // An error line isn't another command's echo.
+        assert!(!echoes_other_command(
+            "GetVersion",
+            "Unknown Cmd: '***'\r\n"
+        ));
+        assert!(echoes_other_command("GetVersion", "TestMode On\r\n"));
     }
 
     #[test]
