@@ -23,7 +23,7 @@ scan_hz = 5.0
 # theta_rad is that arrow's angle from robot forward.
 id = 0
 size_m = 0.100    # TODO: the black square's side, 0.100 or 0.075 as mounted
-height_m = 0.10   # TODO: measure, floor to the tag's face
+height_m = 0.076  # measured, about 3 in from the floor to the tag's face
 x_m = 0.0         # TODO: measure, the tag's centre in the robot frame
 y_m = 0.0
 theta_rad = 0.0
