@@ -19,10 +19,11 @@ Needs python3-opencv and python3-numpy.
 import argparse
 import datetime
 import sys
-import tomllib
 
 import cv2
 import numpy as np
+
+from ceiling import NAMES, Lens, apply, load_arena
 
 # Station palette (crates/station/web/index.html), BGR.
 TRUTH = (115, 204, 76)
@@ -97,43 +98,9 @@ def split_sides(contour, shape, corner_gap=20, border_gap=3):
     return corners, sides
 
 
-class Lens:
-    """OpenCV's pinhole model with two radial terms. The focal length is fixed
-    at a nominal value: one view of a plane square-on to the camera can't tell
-    focal length from height, and the floor homography absorbs it."""
-
-    def __init__(self, f, k1, k2, cx, cy):
-        self.f, self.k1, self.k2, self.cx, self.cy = f, k1, k2, cx, cy
-
-    def undistort(self, px):
-        """Pixels to undistorted normalised coordinates, by Newton on the radius."""
-        xd = (np.asarray(px, float).reshape(-1, 2) - [self.cx, self.cy]) / self.f
-        rd = np.linalg.norm(xd, axis=1)
-        r = rd.copy()
-        for _ in range(30):
-            r2 = r * r
-            g = r * (1 + self.k1 * r2 + self.k2 * r2 * r2) - rd
-            r = r - g / (1 + 3 * self.k1 * r2 + 5 * self.k2 * r2 * r2)
-        scale = np.divide(r, rd, out=np.ones_like(rd), where=rd > 0)
-        return xd * scale[:, None]
-
-    def distort(self, xy):
-        r2 = (xy**2).sum(1, keepdims=True)
-        xy = xy * (1 + self.k1 * r2 + self.k2 * r2**2)
-        return xy * self.f + [self.cx, self.cy]
-
-
 def homography(src, dst):
     h, _ = cv2.findHomography(np.asarray(src, np.float64), np.asarray(dst, np.float64), 0)
     return h
-
-
-def apply(h, pts):
-    p = np.c_[pts, np.ones(len(pts))] @ h.T
-    return p[:, :2] / p[:, 2:]
-
-
-NAMES = ["top_left", "top_right", "bottom_right", "bottom_left"]
 
 
 def residuals(params, f, corners, sides, arena):
@@ -241,8 +208,7 @@ def main():
     img = cv2.imread(args.frame)
     if img is None:
         sys.exit(f"can't read {args.frame}")
-    with open(args.arena, "rb") as f:
-        arena = {k: np.array(v, float) for k, v in tomllib.load(f)["corners"].items()}
+    arena = load_arena(args.arena)
 
     contour = inside_edge(img)
     corners, sides = split_sides(contour, img.shape)

@@ -5,6 +5,8 @@
 //! - `GET /events` streams frames as server-sent events.
 //! - `POST /control` takes one JSON [`Control`].
 //! - `GET /recordings` lists the logs that can be replayed, as JSON.
+//! - `GET /floor.jpg` is the ceiling camera's top-down view of the floor,
+//!   when the station has a camera.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,14 +28,17 @@ pub async fn serve(
     controls: mpsc::Sender<Control>,
     frames: watch::Receiver<Arc<str>>,
     recordings: PathBuf,
+    floor: Option<PathBuf>,
 ) -> Result<()> {
     let recordings: Arc<Path> = recordings.into();
+    let floor: Option<Arc<Path>> = floor.map(Into::into);
     loop {
         let (stream, _) = listener.accept().await?;
         let (controls, frames, recordings) = (controls.clone(), frames.clone(), recordings.clone());
+        let floor = floor.clone();
         tokio::spawn(async move {
             // A browser dropping a connection is routine, not worth a log line.
-            let _ = handle(stream, controls, frames, &recordings).await;
+            let _ = handle(stream, controls, frames, &recordings, floor.as_deref()).await;
         });
     }
 }
@@ -110,6 +115,7 @@ async fn handle(
     controls: mpsc::Sender<Control>,
     mut frames: watch::Receiver<Arc<str>>,
     recordings: &Path,
+    floor: Option<&Path>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(req) = read_request(&mut reader).await? else {
@@ -132,6 +138,13 @@ async fn handle(
             let list = serde_json::to_vec(&recorder::list(recordings))?;
             respond(&mut stream, "200 OK", "application/json", &list).await
         }
+        ("GET", path) if path.starts_with("/floor.jpg") => match floor {
+            Some(floor) => match tokio::fs::read(floor).await {
+                Ok(jpg) => respond(&mut stream, "200 OK", "image/jpeg", &jpg).await,
+                Err(_) => respond(&mut stream, "404 Not Found", TEXT, b"no floor image yet").await,
+            },
+            None => respond(&mut stream, "404 Not Found", TEXT, b"no camera").await,
+        },
         ("GET", "/events") => {
             stream
                 .write_all(

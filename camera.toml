@@ -27,6 +27,12 @@ homography = [
 # looks further from the point under the lens than it is, by height / height_m.
 height_m = 2.41
 
+[timing]
+# How long before the station hears of a frame it was taken: exposure, USB
+# and decoding. TODO: measure, by turning the robot in place and lining the
+# camera's heading up with odometry's.
+latency_ms = 60.0
+
 [fit]
 frame = "20261028-165949-1920x1080.jpg"  # on the station, in ~/arena
 date = 2026-10-28

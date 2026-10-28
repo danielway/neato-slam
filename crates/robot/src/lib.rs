@@ -14,7 +14,7 @@ mod real;
 mod replay;
 pub mod wire;
 
-pub use config::{DriveConfig, LidarConfig, RobotConfig};
+pub use config::{DriveConfig, LidarConfig, MarkerConfig, RobotConfig};
 pub use io::RobotIo;
 #[cfg(feature = "net")]
 pub use real::RealBackend;

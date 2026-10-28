@@ -2,8 +2,11 @@
 //! the simulator or the real robot and drives the sim from the keyboard, so
 //! it can run in a headless sandbox and be viewed from any browser. With
 //! `--headless` it runs a scripted drive and prints odometry against ground
-//! truth, and with `--replay` it does the same over a recorded log.
+//! truth, and with `--replay` it does the same over a recorded log. With
+//! `--camera` it also tracks the real robot with the ceiling camera (see
+//! `camera`), which needs the station started from the repo folder.
 
+mod camera;
 mod http;
 mod recorder;
 mod session;
@@ -20,7 +23,8 @@ use slam::odometry::WheelOdometry;
 use tokio::sync::{mpsc, watch};
 
 const ROBOT_TOML: &str = include_str!("../../../robot.toml");
-const USAGE: &str = "usage: station [--listen 127.0.0.1:8080] [--recordings DIR]
+const USAGE: &str =
+    "usage: station [--listen 127.0.0.1:8080] [--recordings DIR] [--camera /dev/video0]
        station --headless
        station --replay FILE.mcap";
 
@@ -30,6 +34,7 @@ async fn main() -> Result<()> {
     let start = Pose2::new(1.0, 1.0, 0.0);
     let mut listen = String::from("127.0.0.1:8080");
     let mut recordings = PathBuf::from("recordings");
+    let mut camera = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -37,6 +42,7 @@ async fn main() -> Result<()> {
             "--replay" => return replay(config, args.next().context(USAGE)?.into()).await,
             "--listen" => listen = args.next().context(USAGE)?,
             "--recordings" => recordings = args.next().context(USAGE)?.into(),
+            "--camera" => camera = Some(args.next().context(USAGE)?),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -53,14 +59,40 @@ async fn main() -> Result<()> {
         listener.local_addr()?,
         recordings.display()
     );
+    let mut session = session::Session::new(config, start, recordings.clone());
+    let mut topdown = None;
+    if let Some(device) = camera {
+        let arena = arena_corners("arena.toml")?;
+        let path =
+            std::env::temp_dir().join(format!("neato-station-{}-floor.jpg", std::process::id()));
+        println!("station: tracking the robot with the camera at {device}");
+        session = session.with_camera(camera::CameraFeed::spawn(device, path.clone()), arena);
+        topdown = Some(path);
+    }
     let (controls_tx, controls) = mpsc::channel(64);
     let (frames_tx, frames) = watch::channel(Arc::<str>::from("{}"));
-    tokio::spawn(session::run(
-        session::Session::new(config, start, recordings.clone()),
-        controls,
-        frames_tx,
-    ));
-    http::serve(listener, controls_tx, frames, recordings).await
+    tokio::spawn(session::run(session, controls, frames_tx));
+    http::serve(listener, controls_tx, frames, recordings, topdown).await
+}
+
+/// The taped arena's corners from `arena.toml`, clockwise from top left.
+fn arena_corners(path: &str) -> Result<Vec<[f64; 2]>> {
+    #[derive(serde::Deserialize)]
+    struct Arena {
+        corners: std::collections::BTreeMap<String, [f64; 2]>,
+    }
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    let arena: Arena = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+    ["top_left", "top_right", "bottom_right", "bottom_left"]
+        .iter()
+        .map(|k| {
+            arena
+                .corners
+                .get(*k)
+                .copied()
+                .with_context(|| format!("{path} has no corners.{k}"))
+        })
+        .collect()
 }
 
 /// Drives a gentle left arc for ten simulated seconds and reports how far

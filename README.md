@@ -20,6 +20,16 @@ SLAM and tooling talk to one interface, `RobotIo`, with three interchangeable ba
 
 Robot geometry and sensor parameters live in [`robot.toml`](robot.toml). Values marked TODO still need measuring on the real robot.
 
+## Ceiling camera
+
+A webcam on the garage ceiling looks down on a taped arena and gives the real robot a true pose, the way the sim has one. [`arena.toml`](arena.toml) holds the arena's measured corners, and [`camera.toml`](camera.toml) the camera's calibration. The robot wears an AprilTag (36h11, id 0) on its top, described under `[marker]` in `robot.toml`.
+
+- `tools/camera-calibrate.py FRAME` fits the lens and the floor from one frame of the taped arena. The inside tape edges are straight lines whose ends `arena.toml` gives, so it bends the lens until they land on their measured edges, and reports what's left over in millimetres. `--overlay` and `--topdown` save pictures to check it by eye. Rerun it whenever the camera or the tape moves.
+- `tools/camera-tracker.py` finds the tag in each frame and prints the robot's pose. `--image FRAME` tries it on one still.
+- `station --camera /dev/video0`, started from the repo folder, runs the tracker. With the real robot selected, the page shows the camera's pose as the truth, over the floor as the camera sees it, and starts odometry from it. Recordings then carry it on the `/ground_truth` channel, moved onto the Pi's clock: the station takes the Pi's offset from the quickest message deliveries of the last ten seconds, and each frame's age from the tracker, including the camera's own delay from `camera.toml`.
+
+Both tools need `python3-opencv` and `python3-numpy`.
+
 ## Running
 
 ```sh
@@ -28,6 +38,7 @@ cargo run -p station                         # serves the station on http://127.
 cargo run -p station -- --listen 0.0.0.0:8080  # the same, reachable from outside a container
 cargo run -p station -- --headless           # drives the sim for 10 s and prints odometry against truth
 cargo run -p station -- --replay recordings/20261024-174830-real.mcap  # summarises a log and runs odometry over it
+cargo run --release -p station -- --listen 0.0.0.0:8080 --camera /dev/video0  # on the station laptop, with the ceiling camera
 ```
 
 The station has no native window. It serves one page, so it can run headless in a sandbox and be opened from any browser. The page picks the source:

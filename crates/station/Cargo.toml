@@ -13,4 +13,5 @@ serde.workspace = true
 serde_json.workspace = true
 sim.workspace = true
 slam.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "process"] }
+toml.workspace = true
