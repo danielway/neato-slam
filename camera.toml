@@ -1,0 +1,35 @@
+# Ceiling camera calibration, written by tools/camera-calibrate.py.
+# Pixel -> floor: undistort the pixel with [lens] (OpenCV's model, normalised
+# by fx), then apply [floor].homography to get arena metres (see arena.toml).
+
+[image]
+width = 1920
+height = 1080
+
+[lens]
+fx = 960.000  # nominal; one square-on view of the floor can't separate it from height
+fy = 960.000
+cx = 913.480
+cy = 580.809
+k1 = -0.148304283
+k2 = 0.016235471
+
+[floor]
+homography = [
+  [1.545512359e+00, -4.879656644e-02, 1.643460450e+00],
+  [-3.009451096e-02, -1.597620753e+00, 8.165331805e-01],
+  [-1.477224912e-02, -2.200515651e-02, 1.000000000e+00],
+]
+
+[mount]
+# Measured by hand: the lens is about 95 in above the floor, roughly over the
+# middle of the arena. Anything above the floor, such as the robot's marker,
+# looks further from the point under the lens than it is, by height / height_m.
+height_m = 2.41
+
+[fit]
+frame = "20261028-165949-1920x1080.jpg"  # on the station, in ~/arena
+date = 2026-10-28
+edge_pixels = 1200
+edge_rms_mm = 3.08
+edge_max_mm = 9.49

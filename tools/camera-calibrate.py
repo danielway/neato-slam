@@ -254,6 +254,7 @@ def main():
         for x, y in np.round(list(corners.values())).astype(int):
             cv2.circle(dbg, (x, y), 8, LINE, 2)
         cv2.imwrite(args.mask, dbg)
+        print(f"wrote {args.mask}")
     f = args.focal or img.shape[1] / 2
     params = fit(f, corners, sides, arena, img.shape)
     res, h = residuals(params, f, corners, sides, arena)
