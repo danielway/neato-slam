@@ -29,6 +29,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -43,6 +44,10 @@ from ceiling import Camera, load_arena
 SEARCH_MARGIN = 150
 TOPDOWN_MM_PER_PX = 8.0
 TOPDOWN_MARGIN_M = 0.15
+# While the marker is lost, how often to search the whole frame. A search
+# takes most of the laptop for 40 ms, so doing it every frame would starve
+# the station.
+FULL_SEARCH_EVERY_S = 0.25
 
 
 def detector():
@@ -88,8 +93,11 @@ class Finder:
 
     def __init__(self, marker):
         self.marker, self.detect, self.last = marker, detector(), None
+        self.searched = -math.inf
 
-    def find(self, gray):
+    def find(self, gray, now=math.inf):
+        """The marker's corners, or None. The whole frame is only searched
+        once per FULL_SEARCH_EVERY_S, judged by `now`."""
         if self.last is not None:
             h, w = gray.shape
             (u0, v0), (u1, v1) = self.last.min(0), self.last.max(0)
@@ -99,6 +107,10 @@ class Finder:
             if found is not None:
                 self.last = found + [u0, v0]
                 return self.last
+        if now - self.searched < FULL_SEARCH_EVERY_S:
+            self.last = None
+            return None
+        self.searched = now
         self.last = self._find(gray)
         return self.last
 
@@ -170,11 +182,15 @@ class TopDown:
 
 
 def emit(obj):
-    print(json.dumps(obj, separators=(",", ":")), flush=True)
+    try:
+        print(json.dumps(obj, separators=(",", ":")), flush=True)
+    except BrokenPipeError:
+        # The station has gone; leave without unwinding the camera thread.
+        os._exit(0)
 
 
-def describe(cam, marker, finder, gray):
-    corners = finder.find(gray)
+def describe(cam, marker, finder, gray, now=math.inf):
+    corners = finder.find(gray, now)
     if corners is None:
         return None
     pose, side = robot_pose(cam, marker, corners)
@@ -194,6 +210,9 @@ def main():
     ap.add_argument("--robot", default="robot.toml")
     ap.add_argument("--topdown", help="save the floor seen straight down to this JPEG every second")
     args = ap.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    # Leave the station a core or two.
+    cv2.setNumThreads(2)
 
     cam, marker = Camera(args.camera), Marker(args.robot)
     with open(args.camera, "rb") as f:
@@ -230,7 +249,7 @@ def main():
     seq, missed_said = 0, 0.0
     while True:
         frame, at, seq = grabber.next(seq)
-        found = describe(cam, marker, finder, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        found = describe(cam, marker, finder, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), at)
         now = time.monotonic()
         age = round((now - at) * 1000 + latency, 1)
         if found:
@@ -245,5 +264,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (BrokenPipeError, KeyboardInterrupt):
-        pass
+    except KeyboardInterrupt:
+        os._exit(0)
