@@ -1,0 +1,29 @@
+# The garage arena that the ceiling camera watches. The station reads this to
+# map camera pixels to arena coordinates and to draw the boundary.
+#
+# Arena frame: origin at the bottom-left corner as the ceiling camera image
+# shows it, x along the bottom edge toward the bottom-right corner, y toward
+# the top of the image. Metres, right-handed, so angles run counterclockwise
+# like the robot frame.
+#
+# Corners are the inside corners of the tape (tape width excluded).
+
+[measured]
+# Taped out and measured 2026-10-28, in inches, inside the tape.
+# Sides are named as they appear in the camera image.
+top_in = 142.25
+bottom_in = 142.75
+left_in = 69.5
+right_in = 69.5
+diag_top_left_to_bottom_right_in = 156.75
+diag_bottom_left_to_top_right_in = 160.0
+
+[corners]
+# Least-squares fit of the six measurements above (largest residual 0.08 in).
+# The arena is not quite rectangular: it leans about 1.6 degrees, with the
+# top edge about 2 in further right than the bottom one. Interior angles:
+# bottom-left 88.3, bottom-right 91.3, top-right 88.7, top-left 91.7.
+bottom_left = [0.0, 0.0]
+bottom_right = [3.6240, 0.0]
+top_right = [3.6635, 1.7640]
+top_left = [0.0522, 1.7636]
