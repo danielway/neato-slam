@@ -22,8 +22,8 @@ scan_hz = 5.0
 # tools/camera-tracker.py). Printed with an arrow along the tag's top edge;
 # theta_rad is that arrow's angle from robot forward.
 id = 0
-size_m = 0.100    # TODO: the black square's side, 0.100 or 0.075 as mounted
+size_m = 0.100    # the 100 mm print, checked by the camera
 height_m = 0.076  # measured, about 3 in from the floor to the tag's face
-x_m = 0.0         # TODO: measure, the tag's centre in the robot frame
+x_m = 0.02        # from a camera frame: ~12 cm ahead of the lidar. TODO: refine by spinning in place
 y_m = 0.0
 theta_rad = 0.0
