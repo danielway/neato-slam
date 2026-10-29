@@ -6,7 +6,7 @@ ground truth. It prints one JSON object per line on stdout:
 
     {"topdown": "PATH", "bounds": [x0, y0, x1, y1]}
         once at the start with --topdown: the floor seen straight down is
-        saved to PATH every second, covering those arena coordinates.
+        saved to PATH ten times a second, covering those arena coordinates.
     {"age_ms": 41.5, "pose": [x, y, theta], "tag_px": [[u, v], ...], "side_m": 0.1}
         for each frame the marker is found in. pose is the robot's, in the
         arena frame of arena.toml; side_m is the marker's mean side as
@@ -42,7 +42,9 @@ from ceiling import Camera, load_arena
 
 # How far around the last sighting to look first, in pixels.
 SEARCH_MARGIN = 150
-TOPDOWN_MM_PER_PX = 8.0
+TOPDOWN_MM_PER_PX = 4.0
+# How often the top-down view is saved, for the station's live view.
+TOPDOWN_EVERY_S = 0.1
 TOPDOWN_MARGIN_M = 0.15
 # While the marker is lost, how often to search the whole frame. A search
 # takes most of the laptop for 40 ms, so doing it every frame would starve
@@ -154,7 +156,7 @@ class Grabber(threading.Thread):
 
 
 class TopDown:
-    """The floor seen straight down, saved now and then for the station's map."""
+    """The floor seen straight down, saved for the station's live view."""
 
     def __init__(self, cam, arena, path):
         xs = [c[0] for c in arena.values()]
@@ -168,7 +170,7 @@ class TopDown:
         self.map_u, self.map_v = px[:, 0].reshape(h, w), px[:, 1].reshape(h, w)
         self.path, self.saved = path, 0.0
 
-    def maybe_save(self, frame, now, every=1.0):
+    def maybe_save(self, frame, now, every=TOPDOWN_EVERY_S):
         if now - self.saved < every:
             return
         self.saved = now
@@ -208,7 +210,7 @@ def main():
     ap.add_argument("--camera", default="camera.toml")
     ap.add_argument("--arena", default="arena.toml")
     ap.add_argument("--robot", default="robot.toml")
-    ap.add_argument("--topdown", help="save the floor seen straight down to this JPEG every second")
+    ap.add_argument("--topdown", help="keep the floor seen straight down saved to this JPEG, ten times a second")
     args = ap.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     # Leave the station a core or two.

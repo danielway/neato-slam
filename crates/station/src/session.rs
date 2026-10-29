@@ -633,7 +633,8 @@ impl Session {
             .unwrap_or_default();
         let config = &self.config;
         let tape = &mut self.tape;
-        match &mut self.source {
+        let mut anchored = false;
+        let result = match &mut self.source {
             Source::Sim(sim) => {
                 let (command, step) = if sim.paused {
                     (Command::Stop, Duration::ZERO)
@@ -674,6 +675,7 @@ impl Session {
                         real.readings.odometry =
                             WheelOdometry::new(s.pose, config.drive.wheel_base_m);
                         real.anchored = true;
+                        anchored = true;
                     }
                     if let Some(t_ns) = real.clock.to_pi(s.at) {
                         tape.put(|| Entry::Truth { t_ns, pose: s.pose });
@@ -690,7 +692,13 @@ impl Session {
                 replay.advance(elapsed, config);
                 Ok(())
             }
+        };
+        // Odometry jumped to the camera's pose, so the page starts its
+        // trails over.
+        if anchored {
+            self.run += 1;
         }
+        result
     }
 
     fn frame(&self) -> Value {

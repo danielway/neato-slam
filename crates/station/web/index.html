@@ -97,15 +97,47 @@ const store = {
 $("addr").value = store.get("piAddr") || "";
 
 let frame = null, run = -1, trails = { truth: [], odom: [] }, bounds = null, dirty = true;
-// The ceiling camera's view of the floor, refreshed about once a second.
-let floor = null, floorAsked = 0;
+// The ceiling camera's live view of the floor, straightened, read from the
+// station's motion JPEG stream. Each picture is decoded off the page's
+// thread and drawn under the map on the next redraw.
+let floor = null, floorStream = null;
 
-function refreshFloor() {
-  if (Date.now() - floorAsked < 1000) return;
-  floorAsked = Date.now();
-  const img = new Image();
-  img.onload = () => { floor = img; dirty = true; };
-  img.src = `/floor.jpg?${floorAsked}`;
+async function readFloor(signal) {
+  const res = await fetch("/floor.mjpg", { signal });
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    const joined = new Uint8Array(buf.length + value.length);
+    joined.set(buf); joined.set(value, buf.length); buf = joined;
+    for (;;) {
+      // Each part: a head ending in a blank line, then Content-Length bytes.
+      const head = dec.decode(buf.subarray(0, Math.min(buf.length, 256)));
+      const end = head.indexOf("\r\n\r\n"), len = /Content-Length: (\d+)/i.exec(head);
+      if (end < 0 || !len) break;
+      const start = end + 4, size = Number(len[1]);
+      if (buf.length < start + size) break;
+      const jpg = new Blob([buf.slice(start, start + size)], { type: "image/jpeg" });
+      buf = buf.slice(start + size + 2);
+      const img = await createImageBitmap(jpg);
+      if (floor) floor.close();
+      floor = img; dirty = true;
+    }
+  }
+}
+
+function watchFloor(on) {
+  if (on && !floorStream) {
+    const stream = floorStream = new AbortController();
+    readFloor(stream.signal).catch(() => {}).finally(() => {
+      // Try again shortly if the stream ends while it is still wanted.
+      if (floorStream === stream) setTimeout(() => { if (floorStream === stream) floorStream = null; }, 2000);
+    });
+  } else if (!on && floorStream) {
+    floorStream.abort(); floorStream = null;
+    if (floor) { floor.close(); floor = null; }
+  }
 }
 
 function post(body) {
@@ -146,7 +178,7 @@ function onFrame(f) {
   // The view only ever grows within a run, so it doesn't jitter.
   for (const w of f.walls) { grow(w[0], w[1]); grow(w[2], w[3]); }
   for (const c of f.arena || []) grow(c[0], c[1]);
-  if (f.floor) refreshFloor(); else floor = null;
+  watchFloor(!!f.floor);
   for (const p of [f.truth, f.odometry]) if (p) { grow(p[0] - 1, p[1] - 1); grow(p[0] + 1, p[1] + 1); }
   if (!f.walls.length) for (const h of worldHits(f, f.truth || f.odometry)) grow(h[0], h[1]);
   render();

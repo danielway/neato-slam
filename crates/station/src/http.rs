@@ -5,8 +5,8 @@
 //! - `GET /events` streams frames as server-sent events.
 //! - `POST /control` takes one JSON [`Control`].
 //! - `GET /recordings` lists the logs that can be replayed, as JSON.
-//! - `GET /floor.jpg` is the ceiling camera's top-down view of the floor,
-//!   when the station has a camera.
+//! - `GET /floor.mjpg` streams the ceiling camera's top-down view of the
+//!   floor as it changes, when the station has a camera.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,11 +138,8 @@ async fn handle(
             let list = serde_json::to_vec(&recorder::list(recordings))?;
             respond(&mut stream, "200 OK", "application/json", &list).await
         }
-        ("GET", path) if path.starts_with("/floor.jpg") => match floor {
-            Some(floor) => match tokio::fs::read(floor).await {
-                Ok(jpg) => respond(&mut stream, "200 OK", "image/jpeg", &jpg).await,
-                Err(_) => respond(&mut stream, "404 Not Found", TEXT, b"no floor image yet").await,
-            },
+        ("GET", path) if path.starts_with("/floor.mjpg") => match floor {
+            Some(floor) => stream_floor(&mut stream, floor).await,
             None => respond(&mut stream, "404 Not Found", TEXT, b"no camera").await,
         },
         ("GET", "/events") => {
@@ -190,5 +187,41 @@ async fn handle(
             }
         },
         _ => respond(&mut stream, "404 Not Found", TEXT, b"not found").await,
+    }
+}
+
+/// Streams the camera tracker's top-down image as motion JPEG, sending it
+/// again each time the tracker replaces the file.
+async fn stream_floor(stream: &mut TcpStream, floor: &Path) -> std::io::Result<()> {
+    const BOUNDARY: &str = "floor-frame";
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary={BOUNDARY}\r\n\
+                 Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut sent = None;
+    loop {
+        let modified = tokio::fs::metadata(floor)
+            .await
+            .and_then(|m| m.modified())
+            .ok();
+        if modified.is_some()
+            && modified != sent
+            && let Ok(jpg) = tokio::fs::read(floor).await
+        {
+            sent = modified;
+            let head = format!(
+                "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                jpg.len()
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.write_all(&jpg).await?;
+            stream.write_all(b"\r\n").await?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     }
 }

@@ -26,7 +26,7 @@ A webcam on the garage ceiling looks down on a taped arena and gives the real ro
 
 - `tools/camera-calibrate.py FRAME` fits the lens and the floor from one frame of the taped arena. The inside tape edges are straight lines whose ends `arena.toml` gives, so it bends the lens until they land on their measured edges, and reports what's left over in millimetres. `--overlay` and `--topdown` save pictures to check it by eye. Rerun it whenever the camera or the tape moves.
 - `tools/camera-tracker.py` finds the tag in each frame and prints the robot's pose. `--image FRAME` tries it on one still.
-- `station --camera /dev/video0`, started from the repo folder, runs the tracker. With the real robot selected, the page shows the camera's pose as the truth, over the floor as the camera sees it, and starts odometry from it. Recordings then carry it on the `/ground_truth` channel, moved onto the Pi's clock: the station takes the Pi's offset from the quickest message deliveries of the last ten seconds, and each frame's age from the tracker, including the camera's own delay from `camera.toml`.
+- `station --camera /dev/video0`, started from the repo folder, runs the tracker. With the real robot selected, the page shows the camera's pose as the truth over a live, straightened view of the floor, and starts odometry from it. Recordings then carry it on the `/ground_truth` channel, moved onto the Pi's clock: the station takes the Pi's offset from the quickest message deliveries of the last ten seconds, and each frame's age from the tracker, including the camera's own delay from `camera.toml`.
 
 Both tools need `python3-opencv` and `python3-numpy`.
 
