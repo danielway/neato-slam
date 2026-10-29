@@ -30,6 +30,8 @@ A webcam on the garage ceiling looks down on a taped arena and gives the real ro
 
 Both tools need `python3-opencv` and `python3-numpy`.
 
+On the station laptop, `tools/install-station.sh` makes this an appliance: the station runs on boot with the camera, and the laptop logs in and opens the page fullscreen. Other computers on the LAN can open the same page on port 8080.
+
 ## Running
 
 ```sh
