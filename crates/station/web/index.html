@@ -180,7 +180,9 @@ function onFrame(f) {
   for (const c of f.arena || []) grow(c[0], c[1]);
   watchFloor(!!f.floor);
   for (const p of [f.truth, f.odometry]) if (p) { grow(p[0] - 1, p[1] - 1); grow(p[0] + 1, p[1] + 1); }
-  if (!f.walls.length) for (const h of worldHits(f, f.truth || f.odometry)) grow(h[0], h[1]);
+  // Without walls or a taped arena to frame, the scan sets the view. With an
+  // arena, returns from the garage beyond it are drawn but don't widen the view.
+  if (!f.walls.length && !(f.arena && f.arena.length)) for (const h of worldHits(f, f.truth || f.odometry)) grow(h[0], h[1]);
   render();
 }
 
