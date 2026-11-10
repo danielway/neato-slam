@@ -96,6 +96,37 @@ const store = {
 };
 $("addr").value = store.get("piAddr") || "";
 
+// The page's address holds the source it shows (?source=real&addr=…,
+// ?source=replay&file=…, ?source=sim) and the view options, so a reload, or
+// a station that restarted into the sim, comes back to the same source.
+const params = new URLSearchParams(location.search);
+$("odomFrame").checked = params.get("odom") === "1";
+let wanted = (() => {
+  const kind = params.get("source"), addr = params.get("addr"), file = params.get("file");
+  if (kind === "real" && addr) return { kind, addr };
+  if (kind === "replay" && file) return { kind, file };
+  if (kind === "sim") return { kind };
+  return null;
+})();
+// Set when a connection opens, so its first frame can switch to `wanted`.
+let fresh = true, switching = false;
+
+function sourceOf(f) {
+  if (f.backend === "real") return { kind: "real", addr: f.addr };
+  if (f.backend === "replay") return { kind: "replay", file: f.file };
+  return { kind: "sim" };
+}
+
+function sameSource(a, b) { return a.kind === b.kind && a.addr === b.addr && a.file === b.file; }
+
+function writeUrl() {
+  const p = new URLSearchParams();
+  if (wanted) for (const [k, v] of Object.entries({ source: wanted.kind, addr: wanted.addr, file: wanted.file })) if (v) p.set(k, v);
+  if ($("odomFrame").checked) p.set("odom", "1");
+  const q = p.toString();
+  history.replaceState(null, "", q ? `?${q}` : location.pathname);
+}
+
 let frame = null, run = -1, trails = { truth: [], odom: [] }, bounds = null, dirty = true;
 // The ceiling camera's live view of the floor, straightened, read from the
 // station's motion JPEG stream. Each picture is decoded off the page's
@@ -148,8 +179,28 @@ function post(body) {
 // ---- Frames from the station ----
 function connect() {
   const events = new EventSource("/events");
+  let dropped = false;
+  events.onopen = () => {
+    fresh = true;
+    if (dropped) { dropped = false; reloadIfRebuilt(); }
+  };
   events.onmessage = (e) => { onFrame(JSON.parse(e.data)); };
-  events.onerror = () => { frame = null; setState("offline", "offline"); dirty = true; };
+  events.onerror = () => {
+    dropped = true; frame = null; setState("offline", "offline"); dirty = true;
+    // The browser retries on its own unless it gave up on the stream.
+    if (events.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
+  };
+}
+
+// The page is built into the station, so a station that comes back serving
+// a different page has been rebuilt: load the new one.
+let pageText = null;
+fetch("/", { cache: "no-store" }).then((r) => r.text()).then((t) => { pageText = t; }).catch(() => {});
+async function reloadIfRebuilt() {
+  try {
+    const text = await (await fetch("/", { cache: "no-store" })).text();
+    if (pageText !== null && text !== pageText) location.reload();
+  } catch {}
 }
 
 function pushTrail(trail, p) {
@@ -165,8 +216,16 @@ function grow(x, y) {
 
 function onFrame(f) {
   if (f.run === undefined) return;
+  if (fresh) {
+    fresh = false;
+    if (wanted && !sameSource(wanted, sourceOf(f))) { switching = true; post({ op: "use", backend: wanted }); }
+  }
   if (f.run !== run) {
     run = f.run; trails = { truth: [], odom: [] }; bounds = null;
+    // Follow whatever the station shows, from here or another browser, except
+    // the run that was showing when this page asked to switch.
+    if (switching) switching = false;
+    else { wanted = sourceOf(f); writeUrl(); }
     const radio = document.querySelector(`input[name=backend][value=${f.backend}]`);
     if (radio) radio.checked = true;
     if (f.addr) $("addr").value = f.addr;
@@ -356,7 +415,7 @@ window.addEventListener("keydown", (e) => {
   if (e.repeat) return;
   if (e.code === "KeyP") $("pause").click();
   else if (e.code === "KeyR") $("reset").click();
-  else if (e.code === "KeyO") { $("odomFrame").checked = !$("odomFrame").checked; dirty = true; }
+  else if (e.code === "KeyO") { $("odomFrame").checked = !$("odomFrame").checked; dirty = true; writeUrl(); }
 });
 window.addEventListener("keyup", (e) => { if (down.delete(e.code)) sendKeys(false); });
 window.addEventListener("blur", () => { down.clear(); sendKeys(false); });
@@ -385,7 +444,7 @@ $("addr").addEventListener("focus", () => { document.querySelector("input[name=b
 $("addr").addEventListener("keydown", (e) => { if (e.key === "Enter") $("use").click(); });
 $("pause").addEventListener("click", () => post({ op: "pause", paused: frame?.state !== "paused" }));
 $("reset").addEventListener("click", () => post({ op: "reset" }));
-$("odomFrame").addEventListener("change", () => { dirty = true; });
+$("odomFrame").addEventListener("change", () => { dirty = true; writeUrl(); });
 window.addEventListener("resize", () => { dirty = true; });
 
 connect();
