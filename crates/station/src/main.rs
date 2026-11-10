@@ -197,33 +197,58 @@ async fn replay(config: RobotConfig, path: PathBuf) -> Result<()> {
         }
     }
 
-    let start = recording
-        .entries
-        .iter()
-        .find_map(|e| match e {
-            Entry::Truth { pose, .. } => Some(*pose),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let mut odometry = WheelOdometry::new(start, config.drive.wheel_base_m);
-    let mut robot = ReplayBackend::from_recording(recording);
-    while let Some(m) = robot.recv().await? {
-        if let Msg::Wheels(w) = m.msg {
-            odometry.update(w);
+    // Odometry starts at the camera's first sighting, which can come
+    // seconds after the robot set off (the marker is hard to read at the
+    // edge of the view), so wheel travel before it is left out. It is scored
+    // at the last sighting, not at the end, since the camera may have lost
+    // the robot by then.
+    let mut odometry: Option<WheelOdometry> = None;
+    let mut last_truth = None;
+    for entry in &recording.entries {
+        match entry {
+            Entry::Truth { pose, .. } => {
+                let odo = odometry
+                    .get_or_insert_with(|| WheelOdometry::new(*pose, config.drive.wheel_base_m));
+                last_truth = Some((*pose, odo.pose));
+            }
+            Entry::Msg(robot::Stamped {
+                msg: Msg::Wheels(w),
+                ..
+            }) => {
+                if let Some(odo) = &mut odometry {
+                    odo.update(*w);
+                }
+            }
+            _ => {}
         }
     }
-    let est = odometry.pose;
+    if odometry.is_none() {
+        // No truth: odometry from the origin over the whole log.
+        let mut odo = WheelOdometry::new(Pose2::default(), config.drive.wheel_base_m);
+        let mut robot = ReplayBackend::from_recording(recording);
+        while let Some(m) = robot.recv().await? {
+            if let Msg::Wheels(w) = m.msg {
+                odo.update(w);
+            }
+        }
+        odometry = Some(odo);
+    }
+    let est = odometry.expect("set above").pose;
     println!(
         "  odometry ends at x={:.3} y={:.3} theta={:.3}",
         est.x, est.y, est.theta
     );
-    if let Some(truth) = robot.ground_truth() {
+    if let Some((truth, est)) = last_truth {
+        let heading = (est.theta - truth.theta)
+            .sin()
+            .atan2((est.theta - truth.theta).cos());
         println!(
-            "  truth    ends at x={:.3} y={:.3} theta={:.3}, error {:.4} m",
+            "  at the last camera pose x={:.3} y={:.3} theta={:.3}, odometry is off by {:.4} m and {:.1} deg",
             truth.x,
             truth.y,
             truth.theta,
-            (est.x - truth.x).hypot(est.y - truth.y)
+            (est.x - truth.x).hypot(est.y - truth.y),
+            heading.to_degrees()
         );
     }
     Ok(())
