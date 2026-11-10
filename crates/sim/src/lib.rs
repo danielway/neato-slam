@@ -48,8 +48,12 @@ impl Sim {
         }
     }
 
+    /// Drives the wheels. The sim's lidar is always on and it has no test
+    /// mode, so `Lidar` and `TestMode` are ignored.
     pub fn set_command(&mut self, command: Command) {
-        self.command = command;
+        if !matches!(command, Command::Lidar { .. } | Command::TestMode { .. }) {
+            self.command = command;
+        }
     }
 
     pub fn time_ns(&self) -> u64 {
@@ -69,7 +73,7 @@ impl Sim {
                 left_mm_s,
                 right_mm_s,
             } => (left_mm_s.clamp(-max, max), right_mm_s.clamp(-max, max)),
-            Command::Stop => (0.0, 0.0),
+            Command::Stop | Command::Lidar { .. } | Command::TestMode { .. } => (0.0, 0.0),
         };
         let dt_s = self.dt_ns as f64 * 1e-9;
         self.drive

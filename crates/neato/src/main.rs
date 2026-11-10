@@ -15,6 +15,10 @@
 //! wheel the distance it would cover in `--horizon-ms` at that speed, so the
 //! next tick's move replaces it before it runs out. If no command arrives
 //! for `WATCHDOG`, or the station goes away, the wheels are stopped.
+//!
+//! The station can also switch the lidar off, and take the Neato out of
+//! test mode so it charges on its dock. Out of test mode the wheels and
+//! lidar stay off, and only the wheel, bumper and battery readings go on.
 
 mod port;
 
@@ -121,9 +125,10 @@ fn main() -> Result<()> {
             Ok(None) => eprintln!("station {peer} disconnected"),
             Err(e) => eprintln!("station {peer} dropped: {e:#}"),
         }
-        // Stop the wheels and the lidar whenever nobody is watching.
-        robot.stop();
-        robot.lidar_off();
+        // Whenever nobody is watching, stop the wheels and the lidar and
+        // leave test mode, so the Neato charges if it's on its dock. The
+        // next station turns test mode back on.
+        robot.set_test_mode(false);
         next = stations.recv().ok();
     }
     Ok(())
@@ -135,8 +140,28 @@ struct Timing {
     horizon: Duration,
 }
 
-/// The latest command from the station, and when it arrived.
-type Latest = Arc<Mutex<(Command, Instant)>>;
+/// What the station has asked for so far on this connection.
+#[derive(Clone, Copy)]
+struct Wanted {
+    /// The latest drive command (`WheelSpeeds` or `Stop`), and when it came.
+    drive: Command,
+    at: Instant,
+    lidar: bool,
+    test_mode: bool,
+}
+
+impl Default for Wanted {
+    fn default() -> Self {
+        Self {
+            drive: Command::Stop,
+            at: Instant::now(),
+            lidar: true,
+            test_mode: true,
+        }
+    }
+}
+
+type Latest = Arc<Mutex<Wanted>>;
 
 /// The Neato, which may come and go.
 struct Robot {
@@ -145,6 +170,8 @@ struct Robot {
     lidar_on: bool,
     /// Whether the last `SetMotor` sent may still be moving the wheels.
     moving: bool,
+    /// Whether the Neato is in test mode, which `open_and_greet` turns on.
+    test_mode: bool,
     last_attempt: Option<Instant>,
     /// The last open failure printed, so retries every 2 s don't flood the log.
     last_error: String,
@@ -157,6 +184,7 @@ impl Robot {
             port: None,
             lidar_on: false,
             moving: false,
+            test_mode: false,
             last_attempt: None,
             last_error: String::new(),
         }
@@ -189,6 +217,7 @@ impl Robot {
         match open_and_greet(&path) {
             Ok(port) => {
                 self.port = Some(port);
+                self.test_mode = true;
                 self.last_error.clear();
                 true
             }
@@ -234,19 +263,46 @@ impl Robot {
 
     /// Turns the latest command into a `SetMotor`, or stops the wheels if
     /// it is a stop or has gone stale.
-    fn drive(&mut self, latest: &Latest, horizon: Duration) {
-        let (command, at) = *latest.lock().unwrap();
-        match command {
+    fn drive(&mut self, wanted: Wanted, horizon: Duration) {
+        match wanted.drive {
             Command::WheelSpeeds {
                 left_mm_s,
                 right_mm_s,
-            } if at.elapsed() < WATCHDOG => {
+            } if wanted.at.elapsed() < WATCHDOG => {
                 let motor = cmd::wheel_speeds(left_mm_s, right_mm_s, horizon.as_secs_f32());
                 if self.query(&motor).is_some() {
                     self.moving = true;
                 }
             }
             _ => self.stop(),
+        }
+    }
+
+    /// Enters or leaves test mode. Leaving stops the wheels and the lidar
+    /// first, since the firmware takes them back.
+    fn set_test_mode(&mut self, on: bool) {
+        if on == self.test_mode {
+            return;
+        }
+        if !on {
+            self.stop();
+            self.lidar_off();
+        }
+        let command = if on {
+            cmd::TEST_MODE_ON
+        } else {
+            cmd::TEST_MODE_OFF
+        };
+        if self.query(command).is_some() {
+            self.test_mode = on;
+            eprintln!(
+                "test mode {}",
+                if on {
+                    "on"
+                } else {
+                    "off: the Neato may charge"
+                }
+            );
         }
     }
 
@@ -293,7 +349,7 @@ fn serve(
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let connected = Arc::new(AtomicBool::new(true));
-    let latest: Latest = Arc::new(Mutex::new((Command::Stop, Instant::now())));
+    let latest: Latest = Arc::default();
     let reader = {
         let stream = stream.try_clone()?;
         let connected = connected.clone();
@@ -317,10 +373,20 @@ fn serve(
         }
         let started = Instant::now();
         // While the robot is missing, keep the station and keep looking.
-        if robot.try_open() && robot.lidar_up() {
-            robot.drive(&latest, timing.horizon);
+        if robot.try_open() {
+            let wanted = *latest.lock().unwrap();
+            robot.set_test_mode(wanted.test_mode);
+            let scanning = if wanted.test_mode && wanted.lidar {
+                robot.lidar_up()
+            } else {
+                robot.lidar_off();
+                false
+            };
+            if wanted.test_mode {
+                robot.drive(wanted, timing.horizon);
+            }
             let polls = Polls {
-                scan: tick % SCAN_EVERY_TICKS == 0,
+                scan: scanning && tick % SCAN_EVERY_TICKS == 0,
                 charger: tick % CHARGER_EVERY_TICKS == 0,
             };
             if let Err(e) = poll_once(robot, &mut stream, clock, &mut seq, polls) {
@@ -456,7 +522,17 @@ fn read_commands(mut stream: TcpStream, latest: &Latest) -> io::Result<()> {
         let mut body = vec![0; len];
         stream.read_exact(&mut body)?;
         match wire::decode_body::<Command>(&body) {
-            Ok(c) => *latest.lock().unwrap() = (c, Instant::now()),
+            Ok(c) => {
+                let mut wanted = latest.lock().unwrap();
+                match c {
+                    Command::Lidar { on } => wanted.lidar = on,
+                    Command::TestMode { on } => wanted.test_mode = on,
+                    drive => {
+                        wanted.drive = drive;
+                        wanted.at = Instant::now();
+                    }
+                }
+            }
             Err(e) => eprintln!("ignoring an undecodable command: {e}"),
         }
     }

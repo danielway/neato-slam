@@ -73,6 +73,10 @@
     </select></label>
     <label><input type="checkbox" id="odomFrame"> Draw scan from odometry</label>
   </fieldset>
+  <fieldset id="robotControls" hidden>
+    <button id="lidar" title="Spin the robot's lidar up or down">Lidar on</button>
+    <button id="testMode" title="Out of test mode the Neato's own firmware takes over: it charges on the dock, and the wheels and lidar stop">Test mode on</button>
+  </fieldset>
 </header>
 <main><canvas id="view" tabindex="0"></canvas></main>
 <footer>
@@ -297,6 +301,12 @@ function render() {
     replay: "P pause, R plays from the start, O scan frame",
   }[f.backend];
   $("pause").disabled = f.backend === "real";
+  $("robotControls").hidden = f.backend !== "real";
+  if (f.backend === "real") {
+    $("lidar").textContent = f.lidar ? "Lidar on" : "Lidar off";
+    $("testMode").textContent = f.test_mode ? "Test mode on" : "Test mode off (charging)";
+    $("lidar").disabled = !f.test_mode;
+  }
   $("pause").textContent = f.state === "paused" ? "Resume" : "Pause";
   $("speedLabel").hidden = f.backend !== "replay";
   if (f.speed !== undefined && document.activeElement !== $("speed")) $("speed").value = String(f.speed);
@@ -444,6 +454,8 @@ $("addr").addEventListener("focus", () => { document.querySelector("input[name=b
 $("addr").addEventListener("keydown", (e) => { if (e.key === "Enter") $("use").click(); });
 $("pause").addEventListener("click", () => post({ op: "pause", paused: frame?.state !== "paused" }));
 $("reset").addEventListener("click", () => post({ op: "reset" }));
+$("lidar").addEventListener("click", () => { post({ op: "lidar", on: !frame?.lidar }); canvas.focus(); });
+$("testMode").addEventListener("click", () => { post({ op: "testmode", on: !frame?.test_mode }); canvas.focus(); });
 $("odomFrame").addEventListener("change", () => { dirty = true; writeUrl(); });
 window.addEventListener("resize", () => { dirty = true; });
 

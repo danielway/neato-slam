@@ -73,6 +73,10 @@ pub enum Control {
     Record { on: bool },
     /// Replay speed, as a multiple of the recorded pace.
     Speed { speed: f64 },
+    /// Spin the real robot's lidar up or down.
+    Lidar { on: bool },
+    /// Put the real robot in or out of test mode (out lets it charge).
+    TestMode { on: bool },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,6 +260,11 @@ struct RealRun {
     /// The last command sent, and when.
     command: Command,
     sent_at: Instant,
+    /// Whether the lidar should spin and the robot be in test mode, and
+    /// whether pi-node has been told so on this connection.
+    lidar: bool,
+    test_mode: bool,
+    settings_sent: bool,
     readings: Readings,
     events: mpsc::Receiver<RealEvent>,
     reader: JoinHandle<()>,
@@ -276,6 +285,9 @@ impl RealRun {
             commands,
             command: Command::Stop,
             sent_at: Instant::now(),
+            lidar: true,
+            test_mode: true,
+            settings_sent: false,
             readings: Readings::new(config, Pose2::default()),
             events,
             reader,
@@ -288,9 +300,28 @@ impl RealRun {
     fn reconnect(&mut self) {
         self.reader.abort();
         (self.events, self.commands, self.reader) = Self::spawn_reader(self.addr.clone());
+        self.settings_sent = false;
         self.link = Link::Connecting;
         // A restarted pi-node starts its clock over.
         self.clock = PiClock::new();
+    }
+
+    /// Sends the lidar and test-mode settings after a connect or a change,
+    /// and returns them when they went out, for the recording.
+    fn settings(&mut self) -> Vec<Command> {
+        if self.settings_sent || !matches!(self.link, Link::Connected { .. }) {
+            return Vec::new();
+        }
+        let settings = vec![
+            Command::TestMode { on: self.test_mode },
+            Command::Lidar { on: self.lidar },
+        ];
+        if settings.iter().all(|&c| self.commands.try_send(c).is_ok()) {
+            self.settings_sent = true;
+            settings
+        } else {
+            Vec::new()
+        }
     }
 
     /// Sends `command` if it changed, or again if keys are still held, and
@@ -650,6 +681,18 @@ impl Session {
             Control::Record { on: true } if self.tape.recorder.is_none() => self.start_recording(),
             Control::Record { on: false } => self.tape.stop(),
             Control::Record { .. } => {}
+            Control::Lidar { on } => {
+                if let Source::Real(real) = &mut self.source {
+                    real.lidar = on;
+                    real.settings_sent = false;
+                }
+            }
+            Control::TestMode { on } => {
+                if let Source::Real(real) = &mut self.source {
+                    real.test_mode = on;
+                    real.settings_sent = false;
+                }
+            }
             Control::Speed { speed } => {
                 if speed.is_finite() {
                     self.speed = speed.clamp(*SPEEDS.start(), *SPEEDS.end());
@@ -727,10 +770,12 @@ impl Session {
                     }
                 }
                 let command = teleop::command(keys, config.drive.max_wheel_speed_mm_s);
-                if let Some(command) = real.drive(command)
-                    && let Some(t_ns) = real.clock.to_pi(Instant::now())
-                {
-                    tape.put(|| Entry::Command { t_ns, command });
+                let mut sent = real.settings();
+                sent.extend(real.drive(command));
+                if let Some(t_ns) = real.clock.to_pi(Instant::now()) {
+                    for command in sent {
+                        tape.put(|| Entry::Command { t_ns, command });
+                    }
                 }
                 if let Link::Closed { at, .. } = &real.link
                     && at.elapsed() >= RETRY_AFTER
@@ -784,6 +829,8 @@ impl Session {
                     "state": state,
                     "detail": detail,
                     "command": describe(real.command),
+                    "lidar": real.lidar,
+                    "test_mode": real.test_mode,
                     "truth": self.camera.as_ref().and_then(CameraFeed::fresh).map(pose),
                     "walls": [],
                 });
@@ -878,6 +925,8 @@ fn describe(command: Command) -> String {
             format!("wheels L {left_mm_s:+.0} R {right_mm_s:+.0} mm/s")
         }
         Command::Stop => "stopped".to_owned(),
+        Command::Lidar { on } => format!("lidar {}", if on { "on" } else { "off" }),
+        Command::TestMode { on } => format!("test mode {}", if on { "on" } else { "off" }),
     }
 }
 
@@ -924,6 +973,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(keys, Control::Keys(Keys { forward: true, .. })));
+        let charge: Control = serde_json::from_str(r#"{"op":"testmode","on":false}"#).unwrap();
+        assert!(matches!(charge, Control::TestMode { on: false }));
+        let lidar: Control = serde_json::from_str(r#"{"op":"lidar","on":false}"#).unwrap();
+        assert!(matches!(lidar, Control::Lidar { on: false }));
         let real: Control = serde_json::from_str(
             r#"{"op":"use","backend":{"kind":"real","addr":"10.0.0.5:7878"}}"#,
         )
@@ -1034,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_the_real_robot_without_sending_it_anything() {
+    async fn records_the_real_robot_and_sends_only_settings_while_idle() {
         use robot::wire;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -1072,18 +1125,31 @@ mod tests {
         assert!(!rec.truncated);
         assert_eq!(rec.info["source"], "real");
         assert!(rec.info.contains_key(log::ROBOT_TOML));
-        assert_eq!(rec.entries.len(), 3);
-        assert!(rec.entries.iter().all(|e| matches!(e, Entry::Msg(_))));
+        let msgs = rec.entries.iter().filter(|e| matches!(e, Entry::Msg(_)));
+        assert_eq!(msgs.count(), 3);
+        assert!(rec.entries.iter().all(|e| matches!(
+            e,
+            Entry::Msg(_)
+                | Entry::Command {
+                    command: Command::TestMode { on: true } | Command::Lidar { on: true },
+                    ..
+                }
+        )));
 
         session.control(Control::Use {
             backend: Backend::Sim,
         });
-        let mut buf = Vec::new();
-        let n = tokio::time::timeout(Duration::from_secs(1), pi.read_to_end(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(n, 0, "station sent {buf:?}");
+        // With no keys held, only the settings went out, once.
+        let mut sent = Vec::new();
+        while let Ok(len) = pi.read_u32_le().await {
+            let mut body = vec![0; len as usize];
+            pi.read_exact(&mut body).await.unwrap();
+            sent.push(wire::decode_body::<Command>(&body).unwrap());
+        }
+        assert_eq!(
+            sent,
+            [Command::TestMode { on: true }, Command::Lidar { on: true }]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1205,16 +1271,20 @@ mod tests {
         session.tick(FRAME_PERIOD).await.unwrap();
 
         let mut sent = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..4 {
             let len = pi.read_u32_le().await.unwrap() as usize;
             let mut body = vec![0; len];
             pi.read_exact(&mut body).await.unwrap();
             sent.push(wire::decode_body::<Command>(&body).unwrap());
         }
+        assert_eq!(
+            sent[..2],
+            [Command::TestMode { on: true }, Command::Lidar { on: true }]
+        );
         assert!(
-            matches!(sent[0], Command::WheelSpeeds { left_mm_s, right_mm_s } if left_mm_s > 0.0 && left_mm_s == right_mm_s),
+            matches!(sent[2], Command::WheelSpeeds { left_mm_s, right_mm_s } if left_mm_s > 0.0 && left_mm_s == right_mm_s),
             "{sent:?}"
         );
-        assert_eq!(sent[1], Command::Stop);
+        assert_eq!(sent[3], Command::Stop);
     }
 }

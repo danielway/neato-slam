@@ -105,6 +105,17 @@ pub enum Command {
         right_mm_s: f32,
     },
     Stop,
+    /// Spin the lidar up or down. It is on by default; off saves battery
+    /// and noise when scans aren't needed. Leaves the wheels as they are.
+    Lidar {
+        on: bool,
+    },
+    /// The Neato's test mode, which driving and the lidar need. It is on
+    /// by default. Off hands the robot back to its own firmware, which
+    /// charges on the dock; the wheels and lidar stop.
+    TestMode {
+        on: bool,
+    },
 }
 
 /// A planar pose in metres and radians. Desktop-only, never on the wire.
