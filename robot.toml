@@ -5,7 +5,11 @@
 # Robot frame: x forward, y left, angles counterclockwise in radians.
 
 [drive]
-wheel_base_m = 0.2445        # measured 9 5/8" tread centre to tread centre
+# Effective wheel base, fitted from two arena drives against the ceiling
+# camera (2026-11-10): turns gave 0.254-0.258 m. The tape-measured tread
+# centres are 0.2445 m (9 5/8"); the tyres' contact sits wider than that.
+# To be refined by a proper calibration run in milestone 3.
+wheel_base_m = 0.256
 max_wheel_speed_mm_s = 300.0 # TODO: confirm against the model's SetMotor limit
 
 [lidar]

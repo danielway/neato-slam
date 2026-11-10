@@ -29,9 +29,9 @@ height_m = 2.41
 
 [timing]
 # How long before the station hears of a frame it was taken: exposure, USB
-# and decoding. TODO: measure, by turning the robot in place and lining the
-# camera's heading up with odometry's.
-latency_ms = 60.0
+# and decoding. Measured 20-40 ms (2026-11-10) by lining the camera's
+# heading rate up with the encoders' on two arena drives.
+latency_ms = 30.0
 
 [fit]
 frame = "20261028-165949-1920x1080.jpg"  # on the station, in ~/arena
