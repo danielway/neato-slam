@@ -2,9 +2,9 @@
 //! turns its messages into frames for the page.
 //!
 //! The sim is stepped in wall-clock time and driven by the page's keys. The
-//! real robot is view-only: its messages are drawn, but this module never
-//! sends it a command, so the page can't move the drive motors. A replay
-//! plays a recorded log at its original pace, or faster.
+//! real robot is driven by the same keys: held keys are re-sent to `pi-node`
+//! every `RESEND_EVERY`, and `pi-node` stops the wheels if they stop coming.
+//! A replay plays a recorded log at its original pace, or faster.
 //!
 //! The sim or the real robot can be recorded while it is shown: everything
 //! it reports goes into a log in the recordings folder (see `recorder`), and
@@ -48,6 +48,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALL_AFTER: Duration = Duration::from_secs(4);
 /// How long to wait before reconnecting to a Pi that dropped or refused us.
 const RETRY_AFTER: Duration = Duration::from_secs(2);
+/// How often a drive command is re-sent to `pi-node` while keys are held,
+/// well inside its stop watchdog.
+const RESEND_EVERY: Duration = Duration::from_millis(100);
 /// A replay skips through quiet stretches longer than this, such as a
 /// dropped link or a restarted pi-node, whose stamps start over.
 const MAX_REPLAY_GAP_NS: u64 = 2_000_000_000;
@@ -57,7 +60,7 @@ const SPEEDS: std::ops::RangeInclusive<f64> = 0.1..=20.0;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Control {
-    /// The drive keys currently held. Only the sim acts on them.
+    /// The drive keys currently held. They drive the sim or the real robot.
     Keys(Keys),
     /// Switch to another source.
     Use { backend: Backend },
@@ -76,7 +79,7 @@ pub enum Control {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Backend {
     Sim,
-    /// `pi-node` at a host:port, view-only.
+    /// `pi-node` at a host:port, driven by the page's keys.
     Real {
         addr: String,
     },
@@ -248,6 +251,11 @@ enum RealEvent {
 struct RealRun {
     addr: String,
     link: Link,
+    /// Commands for the current connection's writer task.
+    commands: mpsc::Sender<Command>,
+    /// The last command sent, and when.
+    command: Command,
+    sent_at: Instant,
     readings: Readings,
     events: mpsc::Receiver<RealEvent>,
     reader: JoinHandle<()>,
@@ -261,10 +269,13 @@ impl RealRun {
     /// Connects in the background. The reader task owns the backend and only
     /// ever calls `recv` on it.
     fn connect(addr: String, config: &RobotConfig) -> Self {
-        let (events, reader) = Self::spawn_reader(addr.clone());
+        let (events, commands, reader) = Self::spawn_reader(addr.clone());
         Self {
             addr,
             link: Link::Connecting,
+            commands,
+            command: Command::Stop,
+            sent_at: Instant::now(),
             readings: Readings::new(config, Pose2::default()),
             events,
             reader,
@@ -276,17 +287,42 @@ impl RealRun {
     /// Tries again after a drop, keeping the readings so odometry carries on.
     fn reconnect(&mut self) {
         self.reader.abort();
-        (self.events, self.reader) = Self::spawn_reader(self.addr.clone());
+        (self.events, self.commands, self.reader) = Self::spawn_reader(self.addr.clone());
         self.link = Link::Connecting;
         // A restarted pi-node starts its clock over.
         self.clock = PiClock::new();
     }
 
-    fn spawn_reader(target: String) -> (mpsc::Receiver<RealEvent>, JoinHandle<()>) {
+    /// Sends `command` if it changed, or again if keys are still held, and
+    /// returns it when it went out, for the recording.
+    fn drive(&mut self, command: Command) -> Option<Command> {
+        if !matches!(self.link, Link::Connected { .. }) {
+            self.command = Command::Stop;
+            return None;
+        }
+        let due = command != self.command
+            || (command != Command::Stop && self.sent_at.elapsed() >= RESEND_EVERY);
+        if !due || self.commands.try_send(command).is_err() {
+            return None;
+        }
+        let changed = command != self.command;
+        self.command = command;
+        self.sent_at = Instant::now();
+        changed.then_some(command)
+    }
+
+    fn spawn_reader(
+        target: String,
+    ) -> (
+        mpsc::Receiver<RealEvent>,
+        mpsc::Sender<Command>,
+        JoinHandle<()>,
+    ) {
         let (tx, events) = mpsc::channel(256);
+        let (commands, mut queued) = mpsc::channel::<Command>(8);
         let reader = tokio::spawn(async move {
             let connect = tokio::time::timeout(CONNECT_TIMEOUT, RealBackend::connect(target));
-            let mut robot = match connect.await {
+            let robot = match connect.await {
                 Ok(Ok(robot)) => robot,
                 Ok(Err(e)) => {
                     return drop(
@@ -298,6 +334,15 @@ impl RealRun {
                     return drop(tx.send(RealEvent::Closed("connect timed out".into())).await);
                 }
             };
+            let (mut robot, mut sender) = robot.split();
+            // Ends when the run drops its sender or the link breaks.
+            tokio::spawn(async move {
+                while let Some(command) = queued.recv().await {
+                    if sender.send(command).await.is_err() {
+                        return;
+                    }
+                }
+            });
             let _ = tx.send(RealEvent::Connected).await;
             let closed = loop {
                 match robot.recv().await {
@@ -312,7 +357,7 @@ impl RealRun {
             };
             let _ = tx.send(RealEvent::Closed(closed)).await;
         });
-        (events, reader)
+        (events, commands, reader)
     }
 }
 
@@ -681,6 +726,12 @@ impl Session {
                         tape.put(|| Entry::Truth { t_ns, pose: s.pose });
                     }
                 }
+                let command = teleop::command(keys, config.drive.max_wheel_speed_mm_s);
+                if let Some(command) = real.drive(command)
+                    && let Some(t_ns) = real.clock.to_pi(Instant::now())
+                {
+                    tape.put(|| Entry::Command { t_ns, command });
+                }
                 if let Link::Closed { at, .. } = &real.link
                     && at.elapsed() >= RETRY_AFTER
                 {
@@ -732,7 +783,7 @@ impl Session {
                     "addr": real.addr,
                     "state": state,
                     "detail": detail,
-                    "command": "view only",
+                    "command": describe(real.command),
                     "truth": self.camera.as_ref().and_then(CameraFeed::fresh).map(pose),
                     "walls": [],
                 });
@@ -1113,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_robot_never_receives_commands() {
+    async fn real_robot_drives_from_keys_and_stops_on_release() {
         use robot::wire;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -1139,28 +1190,31 @@ mod tests {
         .await
         .unwrap();
 
-        session.control(Control::Keys(Keys {
-            forward: true,
-            fast: true,
-            ..Keys::default()
-        }));
-        for _ in 0..10 {
+        // Connect before pressing keys: nothing is sent while connecting.
+        for _ in 0..5 {
             session.tick(FRAME_PERIOD).await.unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let frame = session.frame();
-        assert_eq!(frame["state"], "connected");
-        assert_eq!(frame["t"], 5e-9);
+        assert_eq!(session.frame()["state"], "connected");
+        session.control(Control::Keys(Keys {
+            forward: true,
+            ..Keys::default()
+        }));
+        session.tick(FRAME_PERIOD).await.unwrap();
+        session.control(Control::Keys(Keys::default()));
+        session.tick(FRAME_PERIOD).await.unwrap();
 
-        // Hanging up must leave the Pi with nothing read.
-        session.control(Control::Use {
-            backend: Backend::Sim,
-        });
-        let mut buf = Vec::new();
-        let n = tokio::time::timeout(Duration::from_secs(1), pi.read_to_end(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(n, 0, "station sent {buf:?}");
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            let len = pi.read_u32_le().await.unwrap() as usize;
+            let mut body = vec![0; len];
+            pi.read_exact(&mut body).await.unwrap();
+            sent.push(wire::decode_body::<Command>(&body).unwrap());
+        }
+        assert!(
+            matches!(sent[0], Command::WheelSpeeds { left_mm_s, right_mm_s } if left_mm_s > 0.0 && left_mm_s == right_mm_s),
+            "{sent:?}"
+        );
+        assert_eq!(sent[1], Command::Stop);
     }
 }

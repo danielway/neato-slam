@@ -293,7 +293,7 @@ function render() {
   $("notice").textContent = f.notice || "";
   $("help").textContent = {
     sim: "Click the map, then WASD/arrows drive, Shift fast, P pause, R reset, O scan frame",
-    real: "View only: the station never drives the real robot. R resets odometry.",
+    real: "Click the map, then WASD/arrows drive the robot, Shift fast. It stops when keys are released. R resets odometry.",
     replay: "P pause, R plays from the start, O scan frame",
   }[f.backend];
   $("pause").disabled = f.backend === "real";

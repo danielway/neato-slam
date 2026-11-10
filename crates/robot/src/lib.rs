@@ -17,7 +17,7 @@ pub mod wire;
 pub use config::{DriveConfig, LidarConfig, MarkerConfig, RobotConfig};
 pub use io::RobotIo;
 #[cfg(feature = "net")]
-pub use real::RealBackend;
+pub use real::{RealBackend, RealReceiver, RealSender};
 pub use replay::ReplayBackend;
 
 use serde::{Deserialize, Serialize};

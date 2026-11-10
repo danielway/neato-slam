@@ -1,6 +1,7 @@
 use std::io;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::wire::{self, MAX_FRAME_LEN};
@@ -17,6 +18,50 @@ impl RealBackend {
         stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
+
+    /// Splits the link so one task can wait for messages while another
+    /// sends commands. `recv` isn't cancel-safe, so the two can't share a
+    /// `select!`.
+    pub fn split(self) -> (RealReceiver, RealSender) {
+        let (read, write) = self.stream.into_split();
+        (RealReceiver(read), RealSender(write))
+    }
+}
+
+/// The receiving half of a [`RealBackend`].
+pub struct RealReceiver(OwnedReadHalf);
+
+impl RealReceiver {
+    pub async fn recv(&mut self) -> io::Result<Option<Stamped<Msg>>> {
+        read_msg(&mut self.0).await
+    }
+}
+
+/// The sending half of a [`RealBackend`].
+pub struct RealSender(OwnedWriteHalf);
+
+impl RealSender {
+    pub async fn send(&mut self, command: Command) -> io::Result<()> {
+        let frame = wire::encode_frame(&command).map_err(invalid)?;
+        self.0.write_all(&frame).await
+    }
+}
+
+async fn read_msg(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Stamped<Msg>>> {
+    let len = match stream.read_u32_le().await {
+        Ok(len) => len as usize,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes"),
+        ));
+    }
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body).await?;
+    wire::decode_body(&body).map(Some).map_err(invalid)
 }
 
 fn invalid(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -25,20 +70,7 @@ fn invalid(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
 
 impl RobotIo for RealBackend {
     async fn recv(&mut self) -> io::Result<Option<Stamped<Msg>>> {
-        let len = match self.stream.read_u32_le().await {
-            Ok(len) => len as usize,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if len > MAX_FRAME_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("frame of {len} bytes"),
-            ));
-        }
-        let mut body = vec![0; len];
-        self.stream.read_exact(&mut body).await?;
-        wire::decode_body(&body).map(Some).map_err(invalid)
+        read_msg(&mut self.stream).await
     }
 
     async fn send(&mut self, command: Command) -> io::Result<()> {

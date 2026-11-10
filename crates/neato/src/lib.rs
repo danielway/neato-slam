@@ -70,7 +70,9 @@ pub fn echoes_other_command(command: &str, reply: &str) -> bool {
     // Only the echo of another command we send counts. Anything else, such
     // as a table or an error line, belongs to this command.
     first.is_some_and(|line| {
-        !line.eq_ignore_ascii_case(command) && cmd::ALL.iter().any(|c| line.eq_ignore_ascii_case(c))
+        !line.eq_ignore_ascii_case(command)
+            && (cmd::ALL.iter().any(|c| line.eq_ignore_ascii_case(c))
+                || line.to_ascii_lowercase().starts_with("setmotor "))
     })
 }
 
@@ -272,6 +274,10 @@ mod tests {
             "Unknown Cmd: '***'\r\n"
         ));
         assert!(echoes_other_command("GetVersion", "TestMode On\r\n"));
+        assert!(echoes_other_command(
+            "GetMotors",
+            "SetMotor LWheelDist 30 RWheelDist 30 Speed 100\r\n"
+        ));
     }
 
     #[test]

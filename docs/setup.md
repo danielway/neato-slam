@@ -140,8 +140,8 @@ With the station showing the real robot, click **Record**, do the run, and click
 cargo run --release -p station -- --replay recordings/<name>.mcap
 ```
 
-It prints what the log holds, how many messages each stream has, and how many gaps in their sequence numbers (messages lost on the way, usually Wi-Fi). Recording never sends the robot anything, so the station stays view-only while it records.
+It prints what the log holds, how many messages each stream has, and how many gaps in their sequence numbers (messages lost on the way, usually Wi-Fi).
 
-## Safety
+## Driving
 
-Driving the real robot is off on both ends. The station never sends it a command, since the page's drive keys only reach the sim. `pi-node` never sends the Neato a drive command either: anything that arrives from the station is logged and dropped. It only uses `GetVersion`, `TestMode`, `SetLDSRotation`, `GetMotors`, `GetDigitalSensors` and `GetLDSScan`. Enabling driving later will be a deliberate change to `pi-node`, together with the 300 ms stop watchdog from the design.
+The page's drive keys drive the real robot. `pi-node` turns the latest wheel speeds into a `SetMotor` each tick and stops the wheels when no command has arrived for 300 ms or the station disconnects. The bumpers are not wired into any of this, and one of them is unreliable.

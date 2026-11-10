@@ -10,17 +10,19 @@
 //! closes the port, and pi-node keeps looking for the robot and reopens it,
 //! without dropping the station.
 //!
-//! Read-only: it never sends the Neato a drive command. Commands that
-//! arrive from the desktop are logged and dropped. Driving will need a
-//! deliberate change here, with the 300 ms stop watchdog from the design.
+//! Driving: the station sends wheel speeds, re-sent while its keys are
+//! held. Each tick, the latest one becomes a `SetMotor` that moves each
+//! wheel the distance it would cover in `--horizon-ms` at that speed, so the
+//! next tick's move replaces it before it runs out. If no command arrives
+//! for `WATCHDOG`, or the station goes away, the wheels are stopped.
 
 mod port;
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,11 +33,15 @@ use robot::{Command, Msg, Stamped};
 
 use crate::port::NeatoPort;
 
-const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878]";
+const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878] [--tick-ms 100] [--horizon-ms 300]";
 
 /// Wheels and bumpers are polled every tick, the lidar every other tick and
-/// the battery once a second.
+/// the battery every tenth. Settable with `--tick-ms`.
 const TICK: Duration = Duration::from_millis(100);
+/// How long a drive command lasts, after which the wheels stop.
+const WATCHDOG: Duration = Duration::from_millis(300);
+/// How far ahead each `SetMotor` reaches. Settable with `--horizon-ms`.
+const HORIZON: Duration = Duration::from_millis(300);
 const SCAN_EVERY_TICKS: u32 = 2;
 const CHARGER_EVERY_TICKS: u32 = 10;
 /// Time for the lidar to reach speed after it is switched on.
@@ -48,11 +54,22 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 fn main() -> Result<()> {
     let mut serial = String::from("auto");
     let mut listen = String::from("0.0.0.0:7878");
+    let mut timing = Timing {
+        tick: TICK,
+        horizon: HORIZON,
+    };
+    let ms = |v: Option<String>| -> Result<Duration> {
+        Ok(Duration::from_millis(
+            v.context(USAGE)?.parse().context(USAGE)?,
+        ))
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--serial" => serial = args.next().context(USAGE)?,
             "--listen" => listen = args.next().context(USAGE)?,
+            "--tick-ms" => timing.tick = ms(args.next())?,
+            "--horizon-ms" => timing.horizon = ms(args.next())?,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -61,6 +78,10 @@ fn main() -> Result<()> {
         }
     }
 
+    eprintln!(
+        "tick {:?}, SetMotor horizon {:?}, stop after {WATCHDOG:?} without a command",
+        timing.tick, timing.horizon
+    );
     let mut robot = Robot::new(serial);
     robot.try_open();
 
@@ -91,7 +112,7 @@ fn main() -> Result<()> {
             .map(|a| a.to_string())
             .unwrap_or_default();
         eprintln!("station connected from {peer}");
-        match serve(&mut robot, stream, clock, &stations) {
+        match serve(&mut robot, stream, clock, &stations, timing) {
             Ok(Some(newer)) => {
                 eprintln!("station {peer} replaced by a newer connection");
                 next = Some(newer);
@@ -100,18 +121,30 @@ fn main() -> Result<()> {
             Ok(None) => eprintln!("station {peer} disconnected"),
             Err(e) => eprintln!("station {peer} dropped: {e:#}"),
         }
-        // Stop the lidar whenever nobody is watching.
+        // Stop the wheels and the lidar whenever nobody is watching.
+        robot.stop();
         robot.lidar_off();
         next = stations.recv().ok();
     }
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Timing {
+    tick: Duration,
+    horizon: Duration,
+}
+
+/// The latest command from the station, and when it arrived.
+type Latest = Arc<Mutex<(Command, Instant)>>;
+
 /// The Neato, which may come and go.
 struct Robot {
     serial: String,
     port: Option<NeatoPort>,
     lidar_on: bool,
+    /// Whether the last `SetMotor` sent may still be moving the wheels.
+    moving: bool,
     last_attempt: Option<Instant>,
     /// The last open failure printed, so retries every 2 s don't flood the log.
     last_error: String,
@@ -123,6 +156,7 @@ impl Robot {
             serial,
             port: None,
             lidar_on: false,
+            moving: false,
             last_attempt: None,
             last_error: String::new(),
         }
@@ -179,6 +213,7 @@ impl Robot {
                 eprintln!("lost the Neato ({e:#}); will keep looking for it");
                 self.port = None;
                 self.lidar_on = false;
+                self.moving = false;
                 None
             }
         }
@@ -195,6 +230,30 @@ impl Robot {
         thread::sleep(LDS_SPIN_UP);
         self.lidar_on = true;
         true
+    }
+
+    /// Turns the latest command into a `SetMotor`, or stops the wheels if
+    /// it is a stop or has gone stale.
+    fn drive(&mut self, latest: &Latest, horizon: Duration) {
+        let (command, at) = *latest.lock().unwrap();
+        match command {
+            Command::WheelSpeeds {
+                left_mm_s,
+                right_mm_s,
+            } if at.elapsed() < WATCHDOG => {
+                let motor = cmd::wheel_speeds(left_mm_s, right_mm_s, horizon.as_secs_f32());
+                if self.query(&motor).is_some() {
+                    self.moving = true;
+                }
+            }
+            _ => self.stop(),
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.moving && self.query(&cmd::set_motor(0, 0, 0)).is_some() {
+            self.moving = false;
+        }
     }
 
     fn lidar_off(&mut self) {
@@ -229,15 +288,18 @@ fn serve(
     mut stream: TcpStream,
     clock: Instant,
     stations: &Receiver<TcpStream>,
+    timing: Timing,
 ) -> Result<Option<TcpStream>> {
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let connected = Arc::new(AtomicBool::new(true));
+    let latest: Latest = Arc::new(Mutex::new((Command::Stop, Instant::now())));
     let reader = {
         let stream = stream.try_clone()?;
         let connected = connected.clone();
+        let latest = latest.clone();
         thread::spawn(move || {
-            if let Err(e) = drain_commands(stream) {
+            if let Err(e) = read_commands(stream, &latest) {
                 eprintln!("command stream ended: {e}");
             }
             connected.store(false, Ordering::Relaxed);
@@ -256,6 +318,7 @@ fn serve(
         let started = Instant::now();
         // While the robot is missing, keep the station and keep looking.
         if robot.try_open() && robot.lidar_up() {
+            robot.drive(&latest, timing.horizon);
             let polls = Polls {
                 scan: tick % SCAN_EVERY_TICKS == 0,
                 charger: tick % CHARGER_EVERY_TICKS == 0,
@@ -265,7 +328,7 @@ fn serve(
             }
             tick = tick.wrapping_add(1);
         }
-        if let Some(rest) = TICK.checked_sub(started.elapsed()) {
+        if let Some(rest) = timing.tick.checked_sub(started.elapsed()) {
             thread::sleep(rest);
         }
     };
@@ -375,8 +438,8 @@ fn log_bad_reply(command: &str, err: &neato::ParseError, reply: &str) {
     eprintln!("could not parse {command} reply ({err}); it began: {head:?}");
 }
 
-/// Reads and drops commands from the station until it disconnects.
-fn drain_commands(mut stream: TcpStream) -> io::Result<()> {
+/// Keeps the station's latest command in `latest` until it disconnects.
+fn read_commands(mut stream: TcpStream, latest: &Latest) -> io::Result<()> {
     loop {
         let mut len = [0u8; 4];
         match stream.read_exact(&mut len) {
@@ -393,8 +456,7 @@ fn drain_commands(mut stream: TcpStream) -> io::Result<()> {
         let mut body = vec![0; len];
         stream.read_exact(&mut body)?;
         match wire::decode_body::<Command>(&body) {
-            Ok(Command::Stop) => {}
-            Ok(c) => eprintln!("ignoring {c:?}: driving the real robot is disabled"),
+            Ok(c) => *latest.lock().unwrap() = (c, Instant::now()),
             Err(e) => eprintln!("ignoring an undecodable command: {e}"),
         }
     }
