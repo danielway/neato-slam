@@ -47,7 +47,7 @@ cargo run --release -p station -- --listen 0.0.0.0:8080 --camera /dev/video0  # 
 
 The station has no native window. It serves one page, so it can run headless in a sandbox and be opened from any browser. The page picks the source:
 
-- **Sim:** click the map, then drive with WASD or the arrow keys (Shift for full speed). P pauses, R resets, O draws the scan from the odometry pose instead of the true one.
+- **Sim:** click the map, then drive with WASD or the arrow keys (Shift for full speed, Space held for fine movement at a quarter speed). P pauses, R resets, O draws the scan from the odometry pose instead of the true one.
 - **Real robot:** enter `pi-node`'s address, such as `192.168.1.50:7878`. The station shows the lidar, odometry, bumpers and battery, and the same keys drive the robot: held keys are re-sent every 100 ms, and `pi-node` stops the wheels within 300 ms of the last command, or when the station disconnects. `pi-node --horizon-ms` sets how far ahead each `SetMotor` reaches and `--tick-ms` its loop period. **Lidar** spins the lidar up or down. **Test mode** off hands the Neato back to its own firmware so it charges on the dock (the wheels and lidar stop); `pi-node` also leaves test mode whenever no station is connected.
 - **Replay:** pick a recording from the list. It plays at the recorded pace, with Pause, a speed setting from 0.25× to 16×, and R to start over. Long gaps, such as a dropped Wi-Fi link, are cut to 2 seconds.
 

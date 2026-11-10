@@ -296,8 +296,8 @@ function render() {
   $("status").textContent = parts.join("   ");
   $("notice").textContent = f.notice || "";
   $("help").textContent = {
-    sim: "Click the map, then WASD/arrows drive, Shift fast, P pause, R reset, O scan frame",
-    real: "Click the map, then WASD/arrows drive the robot, Shift fast. It stops when keys are released. R resets odometry.",
+    sim: "Click the map, then WASD/arrows drive, Shift fast, Space fine, P pause, R reset, O scan frame",
+    real: "Click the map, then WASD/arrows drive the robot, Shift fast, Space fine. It stops when keys are released. R resets odometry.",
     replay: "P pause, R plays from the start, O scan frame",
   }[f.backend];
   $("pause").disabled = f.backend === "real";
@@ -398,6 +398,7 @@ function draw() {
 const DRIVE_KEYS = {
   forward: ["KeyW", "ArrowUp"], back: ["KeyS", "ArrowDown"],
   left: ["KeyA", "ArrowLeft"], right: ["KeyD", "ArrowRight"], fast: ["ShiftLeft", "ShiftRight"],
+  fine: ["Space"],
 };
 const down = new Set();
 let sentKeys = "";

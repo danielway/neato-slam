@@ -5,6 +5,9 @@ use serde::Deserialize;
 const DRIVE_MM_S: f32 = 200.0;
 /// Speed difference between the wheels when turning, mm/s.
 const TURN_MM_S: f32 = 100.0;
+/// The share of those speeds used while the fine-movement key is held, for
+/// lining up with the dock: a tap then moves about a centimetre.
+const FINE: f32 = 0.25;
 
 /// The drive keys held on the page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -14,6 +17,9 @@ pub struct Keys {
     pub left: bool,
     pub right: bool,
     pub fast: bool,
+    /// Fine movement, at a quarter of the normal speeds. Wins over `fast`.
+    #[serde(default)]
+    pub fine: bool,
 }
 
 /// Maps held keys to a wheel-speed command. No keys means `Stop`, so the
@@ -25,7 +31,9 @@ pub fn command(keys: Keys, max_mm_s: f32) -> Command {
     if drive == 0.0 && turn == 0.0 {
         return Command::Stop;
     }
-    let scale = if keys.fast {
+    let scale = if keys.fine {
+        FINE
+    } else if keys.fast {
         max_mm_s / DRIVE_MM_S
     } else {
         1.0
@@ -76,5 +84,19 @@ mod tests {
             panic!("expected wheel speeds");
         };
         assert_eq!(right_mm_s, 300.0);
+    }
+
+    #[test]
+    fn fine_is_slow_even_with_fast() {
+        let keys = Keys {
+            forward: true,
+            fast: true,
+            fine: true,
+            ..Keys::default()
+        };
+        let Command::WheelSpeeds { left_mm_s, .. } = command(keys, 300.0) else {
+            panic!("expected wheel speeds");
+        };
+        assert_eq!(left_mm_s, 50.0);
     }
 }
