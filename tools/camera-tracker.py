@@ -50,6 +50,11 @@ TOPDOWN_MARGIN_M = 0.15
 # takes most of the laptop for 40 ms, so doing it every frame would starve
 # the station.
 FULL_SEARCH_EVERY_S = 0.25
+# How long to keep looking around the last sighting after losing the
+# marker, before falling back to whole-frame searches. A hand or a shadow
+# passing over it, or the camera's auto exposure settling, only hides it
+# for a few frames.
+KEEP_LOOKING_S = 1.0
 
 
 def detector():
@@ -95,7 +100,8 @@ class Finder:
 
     def __init__(self, marker):
         self.marker, self.detect, self.last = marker, detector(), None
-        self.searched = -math.inf
+        self.searched, self.seen = -math.inf, -math.inf
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 
     def find(self, gray, now=math.inf):
         """The marker's corners, or None. The whole frame is only searched
@@ -105,15 +111,24 @@ class Finder:
             (u0, v0), (u1, v1) = self.last.min(0), self.last.max(0)
             u0, v0 = max(int(u0) - SEARCH_MARGIN, 0), max(int(v0) - SEARCH_MARGIN, 0)
             u1, v1 = min(int(u1) + SEARCH_MARGIN, w), min(int(v1) + SEARCH_MARGIN, h)
-            found = self._find(gray[v0:v1, u0:u1])
+            crop = gray[v0:v1, u0:u1]
+            found = self._find(crop)
+            if found is None:
+                # Glare or a shadow across the tag: even out the contrast
+                # and try once more. Cheap on a small crop.
+                found = self._find(self.clahe.apply(crop))
             if found is not None:
-                self.last = found + [u0, v0]
+                self.last, self.seen = found + [u0, v0], now
                 return self.last
-        if now - self.searched < FULL_SEARCH_EVERY_S:
+            if now - self.seen < KEEP_LOOKING_S:
+                return None
             self.last = None
+        if now - self.searched < FULL_SEARCH_EVERY_S:
             return None
         self.searched = now
         self.last = self._find(gray)
+        if self.last is not None:
+            self.seen = now
         return self.last
 
     def _find(self, gray):
