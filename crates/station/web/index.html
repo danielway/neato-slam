@@ -65,6 +65,7 @@
   </fieldset>
   <fieldset>
     <button id="record" title="Record the sim or the real robot to the recordings folder">● Record</button>
+    <button id="driveTest" title="A scripted 24 s drive: straight out and back, spins both ways, short taps. It records itself, and any drive key cancels it">Drive test</button>
     <button id="pause">Pause</button>
     <button id="reset">Reset</button>
     <label id="speedLabel" hidden>Speed <select id="speed">
@@ -279,6 +280,7 @@ function render() {
   if (!f) return;
   setState(`${f.backend} ${f.state}`, f.state);
   const parts = [`t ${f.t.toFixed(2)} s`, f.command];
+  if (f.test) parts.unshift(`drive test: ${f.test.step} (${f.test.seconds}/${f.test.length} s)`);
   if (f.truth) parts.push(`truth ${fmtPose(f.truth)}`);
   parts.push(`odometry ${fmtPose(f.odometry)}`);
   if (f.truth) parts.push(`error ${Math.hypot(f.odometry[0] - f.truth[0], f.odometry[1] - f.truth[1]).toFixed(3)} m`);
@@ -310,6 +312,8 @@ function render() {
   $("pause").textContent = f.state === "paused" ? "Resume" : "Pause";
   $("speedLabel").hidden = f.backend !== "replay";
   if (f.speed !== undefined && document.activeElement !== $("speed")) $("speed").value = String(f.speed);
+  $("driveTest").textContent = f.test ? "Cancel test" : "Drive test";
+  $("driveTest").disabled = f.backend === "replay";
   const rec = $("record"), recording = !!f.recording;
   if (recording !== wasRecording) { wasRecording = recording; if (!recording) loadRecordings(); }
   rec.disabled = f.backend === "replay";
@@ -451,6 +455,7 @@ $("file").addEventListener("focus", () => { document.querySelector("input[name=b
 $("file").addEventListener("change", () => { $("use").click(); });
 $("speed").addEventListener("change", () => { post({ op: "speed", speed: Number($("speed").value) }); canvas.focus(); });
 $("record").addEventListener("click", () => { post({ op: "record", on: !frame?.recording }); canvas.focus(); });
+$("driveTest").addEventListener("click", () => { post({ op: "drivetest", on: !frame?.test }); canvas.focus(); });
 $("addr").addEventListener("focus", () => { document.querySelector("input[name=backend][value=real]").checked = true; });
 $("addr").addEventListener("keydown", (e) => { if (e.key === "Enter") $("use").click(); });
 $("pause").addEventListener("click", () => post({ op: "pause", paused: frame?.state !== "paused" }));

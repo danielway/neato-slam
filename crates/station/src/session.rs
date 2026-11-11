@@ -30,6 +30,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::camera::{CameraFeed, PiClock};
+use crate::drive_test;
 use crate::recorder::{self, Recorder};
 use crate::teleop::{self, Keys};
 
@@ -75,6 +76,8 @@ pub enum Control {
     Speed { speed: f64 },
     /// Spin the real robot's lidar up or down.
     Lidar { on: bool },
+    /// Start or cancel the scripted drive test (see `drive_test`).
+    DriveTest { on: bool },
     /// Put the real robot in or out of test mode (out lets it charge).
     TestMode { on: bool },
 }
@@ -549,6 +552,15 @@ pub struct Session {
     camera: Option<CameraFeed>,
     /// The taped arena's corners, drawn under the real robot with the camera.
     arena: Vec<[f64; 2]>,
+    /// The drive test, when one is running.
+    test: Option<DriveTestRun>,
+}
+
+struct DriveTestRun {
+    started: Instant,
+    /// Whether the test started the recording, and so stops it.
+    recording: bool,
+    step: &'static str,
 }
 
 impl Session {
@@ -565,6 +577,7 @@ impl Session {
             notice: None,
             speed: 1.0,
             camera: None,
+            test: None,
             arena: Vec::new(),
         }
     }
@@ -641,6 +654,7 @@ impl Session {
                 self.keys_at = Instant::now();
             }
             Control::Use { backend } => {
+                self.end_test();
                 let source = match backend {
                     Backend::Sim => Source::Sim(SimRun::new(&self.config, self.start)),
                     Backend::Real { addr } => {
@@ -681,6 +695,22 @@ impl Session {
             Control::Record { on: true } if self.tape.recorder.is_none() => self.start_recording(),
             Control::Record { on: false } => self.tape.stop(),
             Control::Record { .. } => {}
+            Control::DriveTest { on: true } if self.test.is_none() => {
+                if matches!(self.source, Source::Replay(_)) {
+                    return self.notice = Some("the drive test needs the sim or the robot".into());
+                }
+                let recording = self.tape.recorder.is_none();
+                if recording {
+                    self.start_recording();
+                }
+                self.test = Some(DriveTestRun {
+                    started: Instant::now(),
+                    recording,
+                    step: "",
+                });
+            }
+            Control::DriveTest { on: true } => {}
+            Control::DriveTest { on: false } => self.end_test(),
             Control::Lidar { on } => {
                 if let Source::Real(real) = &mut self.source {
                     real.lidar = on;
@@ -704,6 +734,34 @@ impl Session {
         }
     }
 
+    fn end_test(&mut self) {
+        if let Some(test) = self.test.take()
+            && test.recording
+        {
+            self.tape.stop();
+        }
+    }
+
+    /// The drive test's command while one runs, else the keys'. A held
+    /// drive key cancels the test.
+    fn command(&mut self, keys: Keys) -> Command {
+        let max = self.config.drive.max_wheel_speed_mm_s;
+        let Some(test) = &mut self.test else {
+            return teleop::command(keys, max);
+        };
+        let keyed = teleop::command(keys, max);
+        match drive_test::at(test.started.elapsed()) {
+            Some((command, step)) if keyed == Command::Stop => {
+                test.step = step;
+                command
+            }
+            _ => {
+                self.end_test();
+                keyed
+            }
+        }
+    }
+
     fn held_keys(&self) -> Keys {
         if self.keys_at.elapsed() > KEYS_TIMEOUT {
             Keys::default()
@@ -714,6 +772,7 @@ impl Session {
 
     async fn tick(&mut self, elapsed: Duration) -> std::io::Result<()> {
         let keys = self.held_keys();
+        let command = self.command(keys);
         let sightings = self
             .camera
             .as_mut()
@@ -727,8 +786,7 @@ impl Session {
                 let (command, step) = if sim.paused {
                     (Command::Stop, Duration::ZERO)
                 } else {
-                    let max = config.drive.max_wheel_speed_mm_s;
-                    (teleop::command(keys, max), elapsed.min(MAX_STEP))
+                    (command, elapsed.min(MAX_STEP))
                 };
                 sim.advance(command, step.as_nanos() as u64, config, tape)
                     .await
@@ -769,7 +827,6 @@ impl Session {
                         tape.put(|| Entry::Truth { t_ns, pose: s.pose });
                     }
                 }
-                let command = teleop::command(keys, config.drive.max_wheel_speed_mm_s);
                 let mut sent = real.settings();
                 sent.extend(real.drive(command));
                 if let Some(t_ns) = real.clock.to_pi(Instant::now()) {
@@ -890,6 +947,11 @@ impl Session {
                 "entries": r.entries,
             })),
             "notice": self.tape.error.as_ref().or(self.notice.as_ref()),
+            "test": self.test.as_ref().map(|t| json!({
+                "step": t.step,
+                "seconds": t.started.elapsed().as_secs_f64().round(),
+                "length": drive_test::length().as_secs_f64().round(),
+            })),
             "camera": self.camera.as_ref().map(|c| json!({
                 "state": c.state.as_str(),
                 "error": c.error,
@@ -1070,6 +1132,46 @@ mod tests {
         session.control(Control::Record { on: true });
         assert!(session.tape.recorder.is_none());
         assert!(session.frame()["notice"].is_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_test_drives_the_sim_records_and_ends() {
+        let dir = scratch_dir("drive-test");
+        let mut session = Session::new(config(), Pose2::default(), dir.clone());
+        session.control(Control::DriveTest { on: true });
+        assert!(session.tape.recorder.is_some(), "the test records itself");
+        session.tick(FRAME_PERIOD).await.unwrap();
+        let Source::Sim(sim) = &session.source else {
+            panic!("expected the sim");
+        };
+        assert!(matches!(sim.command, Command::WheelSpeeds { left_mm_s, .. } if left_mm_s > 0.0));
+        assert_eq!(session.frame()["test"]["step"], "forward");
+
+        // Skip to the reverse step, then past the end.
+        session.test.as_mut().unwrap().started -= Duration::from_secs_f32(4.5);
+        session.tick(FRAME_PERIOD).await.unwrap();
+        let Source::Sim(sim) = &session.source else {
+            panic!("expected the sim");
+        };
+        assert!(matches!(sim.command, Command::WheelSpeeds { left_mm_s, .. } if left_mm_s < 0.0));
+        session.test.as_mut().unwrap().started -= drive_test::length();
+        session.tick(FRAME_PERIOD).await.unwrap();
+        assert!(session.test.is_none());
+        assert!(
+            session.tape.recorder.is_none(),
+            "the test stops its recording"
+        );
+        assert_eq!(recorder::list(&dir).len(), 1);
+
+        // A drive key cancels a running test.
+        session.control(Control::DriveTest { on: true });
+        session.control(Control::Keys(Keys {
+            left: true,
+            ..Keys::default()
+        }));
+        session.tick(FRAME_PERIOD).await.unwrap();
+        assert!(session.test.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

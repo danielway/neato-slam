@@ -7,6 +7,7 @@
 //! `camera`), which needs the station started from the repo folder.
 
 mod camera;
+mod drive_test;
 mod http;
 mod recorder;
 mod session;
