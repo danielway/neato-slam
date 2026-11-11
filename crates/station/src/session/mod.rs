@@ -12,27 +12,35 @@
 //! ceiling camera running (see `camera`), the real robot has a true pose as
 //! well, and its recordings carry it.
 
+mod frame;
+mod readings;
+mod real;
+mod replay;
+mod sim;
+mod tape;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use robot::log::{self, Entry, Recording};
-use robot::{
-    Command, Contacts, LidarScan, Msg, Pose2, RealBackend, RobotConfig, RobotIo, RobotStatus,
-    Stamped,
-};
+use robot::{Command, Pose2, RobotConfig};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use sim::{Segment, Sim, SimBackend, World};
+use serde_json::json;
 use slam::odometry::WheelOdometry;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 
-use crate::camera::{CameraFeed, PiClock};
+use crate::camera::CameraFeed;
 use crate::drive_test;
 use crate::recorder::{self, Recorder};
 use crate::teleop::{self, Keys};
+
+use readings::Readings;
+use real::{Link, RETRY_AFTER, RealEvent, RealRun};
+use replay::ReplayRun;
+use sim::SimRun;
+use tape::Tape;
 
 /// How often frames go out to the page.
 const FRAME_PERIOD: Duration = Duration::from_millis(33);
@@ -42,19 +50,6 @@ const MAX_STEP: Duration = Duration::from_millis(100);
 /// than this (a closed tab, a dropped connection), the keys count as
 /// released.
 const KEYS_TIMEOUT: Duration = Duration::from_millis(500);
-/// How long to wait for the Pi to accept a connection.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A connected Pi that sends nothing for this long is reported as stalled.
-/// It covers the 2 s lidar spin-up after connecting.
-const STALL_AFTER: Duration = Duration::from_secs(4);
-/// How long to wait before reconnecting to a Pi that dropped or refused us.
-const RETRY_AFTER: Duration = Duration::from_secs(2);
-/// How often a drive command is re-sent to `pi-node` while keys are held,
-/// well inside its stop watchdog.
-const RESEND_EVERY: Duration = Duration::from_millis(100);
-/// A replay skips through quiet stretches longer than this, such as a
-/// dropped link or a restarted pi-node, whose stamps start over.
-const MAX_REPLAY_GAP_NS: u64 = 2_000_000_000;
 const SPEEDS: std::ops::RangeInclusive<f64> = 0.1..=20.0;
 
 /// What the page can ask for.
@@ -96,441 +91,10 @@ pub enum Backend {
     },
 }
 
-/// A room with a few obstacles, so scans have some structure to show.
-pub fn demo_world() -> World {
-    let mut world = World::rectangle(6.0, 4.5);
-    let mut wall = |a: (f64, f64), b: (f64, f64)| world.segments.push(Segment { a, b });
-    // An interior wall with a doorway.
-    wall((3.5, 0.0), (3.5, 1.6));
-    wall((3.5, 2.4), (3.5, 3.2));
-    // A box, like a cabinet.
-    let (x0, y0, x1, y1) = (1.2, 3.2, 2.2, 3.8);
-    wall((x0, y0), (x1, y0));
-    wall((x1, y0), (x1, y1));
-    wall((x1, y1), (x0, y1));
-    wall((x0, y1), (x0, y0));
-    // An angled piece of furniture in the second room.
-    wall((4.5, 3.6), (5.4, 2.9));
-    world
-}
-
-/// What both sources feed: odometry and the latest readings.
-struct Readings {
-    odometry: WheelOdometry,
-    /// Stamp of the latest message.
-    t_ns: u64,
-    /// Latest scan hits in the robot frame, metres.
-    hits: Vec<[f64; 2]>,
-    contacts: Contacts,
-    status: Option<RobotStatus>,
-}
-
-impl Readings {
-    fn new(config: &RobotConfig, start: Pose2) -> Self {
-        Self {
-            odometry: WheelOdometry::new(start, config.drive.wheel_base_m),
-            t_ns: 0,
-            hits: Vec::new(),
-            contacts: Contacts::default(),
-            status: None,
-        }
-    }
-
-    fn update(&mut self, m: Stamped<Msg>, config: &RobotConfig) {
-        self.t_ns = m.t_ns;
-        match m.msg {
-            Msg::Wheels(w) => {
-                self.odometry.update(w);
-            }
-            Msg::Lidar(scan) => self.hits = robot_frame_hits(&scan, config),
-            Msg::Contacts(c) => self.contacts = c,
-            Msg::Status(s) => self.status = Some(s),
-        }
-    }
-}
-
-/// A scan's valid returns as points in the robot frame.
-fn robot_frame_hits(scan: &LidarScan, config: &RobotConfig) -> Vec<[f64; 2]> {
-    let lidar = &config.lidar;
-    let mount = Pose2::new(lidar.x_m, lidar.y_m, lidar.theta_rad);
-    scan.ranges
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.is_finite())
-        .map(|(i, &r)| {
-            let a = (scan.angle_min + i as f32 * scan.angle_increment) as f64;
-            let (x, y) = mount.transform_point(r as f64 * a.cos(), r as f64 * a.sin());
-            [x, y]
-        })
-        .collect()
-}
-
-struct SimRun {
-    robot: SimBackend,
-    readings: Readings,
-    /// Where sim time should be by now. The sim steps in whole physics
-    /// steps, so it runs up to this rather than a frame past its last
-    /// stamp, which would round every frame up and run fast.
-    clock_ns: u64,
-    command: Command,
-    paused: bool,
-}
-
-impl SimRun {
-    fn new(config: &RobotConfig, start: Pose2) -> Self {
-        Self {
-            robot: SimBackend::new(Sim::new(demo_world(), config.clone(), start, 0.01)),
-            readings: Readings::new(config, start),
-            clock_ns: 0,
-            command: Command::Stop,
-            paused: false,
-        }
-    }
-
-    /// Sends the command if it changed, then runs the sim `step_ns` further.
-    async fn advance(
-        &mut self,
-        command: Command,
-        step_ns: u64,
-        config: &RobotConfig,
-        tape: &mut Tape,
-    ) -> std::io::Result<()> {
-        if command != self.command {
-            self.robot.send(command).await?;
-            self.command = command;
-            let t_ns = self.robot.sim().time_ns();
-            tape.put(|| Entry::Command { t_ns, command });
-        }
-        self.clock_ns += step_ns;
-        while self.readings.t_ns < self.clock_ns {
-            let Some(m) = self.robot.recv().await? else {
-                break;
-            };
-            // Wheels come first from each physics step, when the sim's pose
-            // is that step's, so the truth goes in just ahead of them.
-            if matches!(m.msg, Msg::Wheels(_)) {
-                let pose = self
-                    .robot
-                    .ground_truth()
-                    .expect("the sim always knows its pose");
-                tape.put(|| Entry::Truth { t_ns: m.t_ns, pose });
-            }
-            tape.put(|| Entry::Msg(m.clone()));
-            self.readings.update(m, config);
-        }
-        Ok(())
-    }
-
-    fn walls(&self) -> Vec<[f64; 4]> {
-        self.robot
-            .sim()
-            .world
-            .segments
-            .iter()
-            .map(|s| [s.a.0, s.a.1, s.b.0, s.b.1])
-            .collect()
-    }
-}
-
-enum Link {
-    Connecting,
-    /// TCP is up. The instant is when data last arrived, or when the link
-    /// came up if nothing has yet, so a link that carries no data can be told
-    /// apart from a live one.
-    Connected {
-        last_data: Instant,
-    },
-    /// The link dropped, and a reconnect is due once `RETRY_AFTER` passes.
-    Closed {
-        why: String,
-        at: Instant,
-    },
-}
-
-/// What the reader task reports.
-enum RealEvent {
-    Connected,
-    /// A message, and when it arrived.
-    Msg(Stamped<Msg>, Instant),
-    Closed(String),
-}
-
-struct RealRun {
-    addr: String,
-    link: Link,
-    /// Commands for the current connection's writer task.
-    commands: mpsc::Sender<Command>,
-    /// The last command sent, and when.
-    command: Command,
-    sent_at: Instant,
-    /// Whether the lidar should spin and the robot be in test mode, and
-    /// whether pi-node has been told so on this connection.
-    lidar: bool,
-    test_mode: bool,
-    settings_sent: bool,
-    readings: Readings,
-    events: mpsc::Receiver<RealEvent>,
-    reader: JoinHandle<()>,
-    /// The Pi's clock, for stamping the camera's sightings.
-    clock: PiClock,
-    /// Whether odometry has been started from the camera's pose yet.
-    anchored: bool,
-}
-
-impl RealRun {
-    /// Connects in the background. The reader task owns the backend and only
-    /// ever calls `recv` on it.
-    fn connect(addr: String, config: &RobotConfig) -> Self {
-        let (events, commands, reader) = Self::spawn_reader(addr.clone());
-        Self {
-            addr,
-            link: Link::Connecting,
-            commands,
-            command: Command::Stop,
-            sent_at: Instant::now(),
-            lidar: true,
-            test_mode: true,
-            settings_sent: false,
-            readings: Readings::new(config, Pose2::default()),
-            events,
-            reader,
-            clock: PiClock::new(),
-            anchored: false,
-        }
-    }
-
-    /// Tries again after a drop, keeping the readings so odometry carries on.
-    fn reconnect(&mut self) {
-        self.reader.abort();
-        (self.events, self.commands, self.reader) = Self::spawn_reader(self.addr.clone());
-        self.settings_sent = false;
-        self.link = Link::Connecting;
-        // A restarted pi-node starts its clock over.
-        self.clock = PiClock::new();
-    }
-
-    /// Sends the lidar and test-mode settings after a connect or a change,
-    /// and returns them when they went out, for the recording.
-    fn settings(&mut self) -> Vec<Command> {
-        if self.settings_sent || !matches!(self.link, Link::Connected { .. }) {
-            return Vec::new();
-        }
-        let settings = vec![
-            Command::TestMode { on: self.test_mode },
-            Command::Lidar { on: self.lidar },
-        ];
-        if settings.iter().all(|&c| self.commands.try_send(c).is_ok()) {
-            self.settings_sent = true;
-            settings
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Sends `command` if it changed, or again if keys are still held, and
-    /// returns it when it went out, for the recording.
-    fn drive(&mut self, command: Command) -> Option<Command> {
-        if !matches!(self.link, Link::Connected { .. }) {
-            self.command = Command::Stop;
-            return None;
-        }
-        let due = command != self.command
-            || (command != Command::Stop && self.sent_at.elapsed() >= RESEND_EVERY);
-        if !due || self.commands.try_send(command).is_err() {
-            return None;
-        }
-        let changed = command != self.command;
-        self.command = command;
-        self.sent_at = Instant::now();
-        changed.then_some(command)
-    }
-
-    fn spawn_reader(
-        target: String,
-    ) -> (
-        mpsc::Receiver<RealEvent>,
-        mpsc::Sender<Command>,
-        JoinHandle<()>,
-    ) {
-        let (tx, events) = mpsc::channel(256);
-        let (commands, mut queued) = mpsc::channel::<Command>(8);
-        let reader = tokio::spawn(async move {
-            let connect = tokio::time::timeout(CONNECT_TIMEOUT, RealBackend::connect(target));
-            let robot = match connect.await {
-                Ok(Ok(robot)) => robot,
-                Ok(Err(e)) => {
-                    return drop(
-                        tx.send(RealEvent::Closed(format!("connect failed: {e}")))
-                            .await,
-                    );
-                }
-                Err(_) => {
-                    return drop(tx.send(RealEvent::Closed("connect timed out".into())).await);
-                }
-            };
-            let (mut robot, mut sender) = robot.split();
-            // Ends when the run drops its sender or the link breaks.
-            tokio::spawn(async move {
-                while let Some(command) = queued.recv().await {
-                    if sender.send(command).await.is_err() {
-                        return;
-                    }
-                }
-            });
-            let _ = tx.send(RealEvent::Connected).await;
-            let closed = loop {
-                match robot.recv().await {
-                    Ok(Some(m)) => {
-                        if tx.send(RealEvent::Msg(m, Instant::now())).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => break "pi-node closed the connection".to_owned(),
-                    Err(e) => break format!("link error: {e}"),
-                }
-            };
-            let _ = tx.send(RealEvent::Closed(closed)).await;
-        });
-        (events, commands, reader)
-    }
-}
-
-impl Drop for RealRun {
-    fn drop(&mut self) {
-        self.reader.abort();
-    }
-}
-
-struct ReplayRun {
-    name: String,
-    recording: Arc<Recording>,
-    /// Each entry's place on the playback clock: its stamp relative to the
-    /// first, with long gaps cut short.
-    timeline: Vec<u64>,
-    /// The next entry to play.
-    next: usize,
-    clock_ns: u64,
-    speed: f64,
-    paused: bool,
-    readings: Readings,
-    truth: Option<Pose2>,
-    command: Option<Command>,
-    /// Walls of a sim recording's world.
-    walls: Value,
-}
-
-impl ReplayRun {
-    fn new(name: String, recording: Arc<Recording>, config: &RobotConfig, speed: f64) -> Self {
-        let mut timeline = Vec::with_capacity(recording.entries.len());
-        let mut last = None;
-        let mut at = 0u64;
-        for entry in &recording.entries {
-            let t = entry.t_ns();
-            if let Some(last) = last {
-                at += t.saturating_sub(last).min(MAX_REPLAY_GAP_NS);
-            }
-            last = Some(t);
-            timeline.push(at);
-        }
-        // Odometry starts where the truth does, when the log has it.
-        let start = recording
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                Entry::Truth { pose, .. } => Some(*pose),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let walls = recording
-            .info
-            .get("world")
-            .and_then(|w| serde_json::from_str(w).ok())
-            .unwrap_or_else(|| json!([]));
-        Self {
-            name,
-            timeline,
-            next: 0,
-            clock_ns: 0,
-            speed,
-            paused: false,
-            readings: Readings::new(config, start),
-            truth: None,
-            command: None,
-            walls,
-            recording,
-        }
-    }
-
-    fn restart(&mut self, config: &RobotConfig) {
-        let paused = self.paused;
-        *self = Self::new(
-            self.name.clone(),
-            self.recording.clone(),
-            config,
-            self.speed,
-        );
-        self.paused = paused;
-    }
-
-    fn duration_ns(&self) -> u64 {
-        self.timeline.last().copied().unwrap_or(0)
-    }
-
-    fn ended(&self) -> bool {
-        self.next >= self.timeline.len()
-    }
-
-    fn advance(&mut self, elapsed: Duration, config: &RobotConfig) {
-        if !self.paused {
-            self.clock_ns += (elapsed.min(MAX_STEP).as_nanos() as f64 * self.speed) as u64;
-        }
-        while self.next < self.timeline.len() && self.timeline[self.next] <= self.clock_ns {
-            match &self.recording.entries[self.next] {
-                Entry::Msg(m) => self.readings.update(m.clone(), config),
-                Entry::Truth { pose, .. } => self.truth = Some(*pose),
-                Entry::Command { command, .. } => self.command = Some(*command),
-            }
-            self.next += 1;
-        }
-        self.clock_ns = self.clock_ns.min(self.duration_ns());
-    }
-}
-
 enum Source {
     Sim(SimRun),
     Real(RealRun),
     Replay(ReplayRun),
-}
-
-/// The recording in progress, if any.
-#[derive(Default)]
-struct Tape {
-    recorder: Option<Recorder>,
-    /// Why the last recording failed, for the page.
-    error: Option<String>,
-}
-
-impl Tape {
-    /// Writes an entry if recording. The entry is only built when needed.
-    fn put(&mut self, entry: impl FnOnce() -> Entry) {
-        let Some(rec) = &mut self.recorder else {
-            return;
-        };
-        if let Err(e) = rec.write(&entry()) {
-            self.error = Some(format!("recording {} stopped: {e}", rec.name));
-            self.recorder = None;
-        }
-    }
-
-    fn stop(&mut self) {
-        if let Some(rec) = self.recorder.take() {
-            let name = rec.name.clone();
-            match rec.finish() {
-                Ok(()) => println!("station: saved recording {name}"),
-                Err(e) => self.error = Some(format!("saving recording {name} failed: {e}")),
-            }
-        }
-    }
 }
 
 pub struct Session {
@@ -853,143 +417,6 @@ impl Session {
         }
         result
     }
-
-    fn frame(&self) -> Value {
-        let pose = |p: Pose2| json!([round(p.x), round(p.y), round(p.theta)]);
-        let (readings, mut frame) = match &self.source {
-            Source::Sim(sim) => {
-                let frame = json!({
-                    "backend": "sim",
-                    "state": if sim.paused { "paused" } else { "running" },
-                    "command": describe(sim.command),
-                    "truth": pose(sim.robot.ground_truth().expect("the sim always knows its pose")),
-                    "walls": sim.walls(),
-                });
-                (&sim.readings, frame)
-            }
-            Source::Real(real) => {
-                let (state, detail) = match &real.link {
-                    Link::Connecting => ("connecting", String::new()),
-                    Link::Connected { last_data } if last_data.elapsed() >= STALL_AFTER => (
-                        "stalled",
-                        format!(
-                            "connected, but no data for {:.0} s",
-                            last_data.elapsed().as_secs_f64()
-                        ),
-                    ),
-                    Link::Connected { .. } => ("connected", String::new()),
-                    Link::Closed { why, .. } => ("disconnected", format!("{why}; retrying")),
-                };
-                let frame = json!({
-                    "backend": "real",
-                    "addr": real.addr,
-                    "state": state,
-                    "detail": detail,
-                    "command": describe(real.command),
-                    "lidar": real.lidar,
-                    "test_mode": real.test_mode,
-                    "truth": self.camera.as_ref().and_then(CameraFeed::fresh).map(pose),
-                    "walls": [],
-                });
-                (&real.readings, frame)
-            }
-            Source::Replay(replay) => {
-                let state = if replay.ended() {
-                    "ended"
-                } else if replay.paused {
-                    "paused"
-                } else {
-                    "playing"
-                };
-                let mut detail = format!(
-                    "{}  {:.1} / {:.1} s",
-                    replay.name,
-                    replay.clock_ns as f64 * 1e-9,
-                    replay.duration_ns() as f64 * 1e-9,
-                );
-                if replay.recording.truncated {
-                    detail.push_str(" (cut short)");
-                }
-                let frame = json!({
-                    "backend": "replay",
-                    "file": replay.name,
-                    "state": state,
-                    "detail": detail,
-                    "command": replay.command.map_or_else(|| "replay".to_owned(), describe),
-                    "truth": replay.truth.map(pose),
-                    "walls": replay.walls,
-                    "speed": replay.speed,
-                });
-                (&replay.readings, frame)
-            }
-        };
-        let hits: Vec<_> = readings
-            .hits
-            .iter()
-            .map(|&[x, y]| [round(x), round(y)])
-            .collect();
-        let extra = json!({
-            "run": self.run,
-            "t": readings.t_ns as f64 * 1e-9,
-            "odometry": pose(readings.odometry.pose),
-            "hits": hits,
-            "bumpers": readings.contacts.bumpers,
-            "wheel_drop": readings.contacts.wheel_drop,
-            "battery": readings.status.map(|s| json!({
-                "v": s.battery_v,
-                "percent": s.fuel_percent,
-                "charging": s.charging,
-                "external_power": s.external_power,
-            })),
-            "recording": self.tape.recorder.as_ref().map(|r| json!({
-                "file": r.name,
-                "seconds": r.started.elapsed().as_secs_f64().round(),
-                "entries": r.entries,
-            })),
-            "notice": self.tape.error.as_ref().or(self.notice.as_ref()),
-            "test": self.test.as_ref().map(|t| json!({
-                "step": t.step,
-                "seconds": t.started.elapsed().as_secs_f64().round(),
-                "length": drive_test::length().as_secs_f64().round(),
-            })),
-            "camera": self.camera.as_ref().map(|c| json!({
-                "state": c.state.as_str(),
-                "error": c.error,
-            })),
-        });
-        if let (Value::Object(frame), Value::Object(extra)) = (&mut frame, extra) {
-            frame.extend(extra);
-            // The arena and the floor under it, everywhere but the sim.
-            if let Some(camera) = &self.camera
-                && !matches!(self.source, Source::Sim(_))
-            {
-                frame.insert("arena".into(), json!(self.arena));
-                if let Some(t) = &camera.topdown {
-                    frame.insert("floor".into(), json!({ "bounds": t.bounds }));
-                }
-            }
-        }
-        frame
-    }
-}
-
-/// Millimetre precision is plenty for drawing and keeps frames small.
-fn round(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0
-}
-
-fn describe(command: Command) -> String {
-    match command {
-        Command::WheelSpeeds {
-            left_mm_s,
-            right_mm_s,
-        } => {
-            format!("wheels L {left_mm_s:+.0} R {right_mm_s:+.0} mm/s")
-        }
-        Command::Stop => "stopped".to_owned(),
-        Command::Lidar { on } => format!("lidar {}", if on { "on" } else { "off" }),
-        Command::TestMode { on } => format!("test mode {}", if on { "on" } else { "off" }),
-    }
 }
 
 /// Applies controls from the page and publishes a frame every tick, until
@@ -1023,9 +450,10 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use robot::{Msg, Stamped};
 
     fn config() -> RobotConfig {
-        RobotConfig::from_toml_str(include_str!("../../../robot.toml")).unwrap()
+        RobotConfig::from_toml_str(include_str!("../../../../robot.toml")).unwrap()
     }
 
     #[test]
