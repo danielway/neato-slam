@@ -4,8 +4,9 @@
 //! stream as the real robot, plus the exact pose and map as ground truth.
 //!
 //! Not yet modelled: wheel slip and encoder noise, lidar range noise and
-//! dropouts, motion skew within a scan, collisions and bumpers. Their
-//! parameters will be fitted from real logs.
+//! dropouts, motion skew within a scan, collisions and bumpers. They will
+//! get plausible values, measured from real logs only if the sim and the
+//! robot disagree.
 
 mod backend;
 mod drive;

@@ -13,7 +13,7 @@ SLAM and tooling talk to one interface, `RobotIo`, with three interchangeable ba
 | Crate | Runs on | Purpose |
 | --- | --- | --- |
 | `robot` | both | Messages, `robot.toml` config, TCP framing, MCAP logs, the `RobotIo` trait, real and replay backends |
-| `neato` | Pi | Neato USB serial protocol, plus the `pi-node` binary that bridges it to the desktop (stub) |
+| `neato` | Pi | Neato USB serial protocol, plus the `pi-node` binary that bridges it to the desktop |
 | `sim` | desktop | World, diff-drive kinematics, lidar raycasting, the sim backend |
 | `slam` | desktop | SLAM algorithms and their scoring against ground truth |
 | `station` | desktop | Control app served as a web page: the sim or the real robot driven from the keyboard, recording and replay |
