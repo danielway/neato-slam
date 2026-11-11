@@ -205,19 +205,24 @@ async fn replay(config: RobotConfig, path: PathBuf) -> Result<()> {
     // the robot by then.
     let mut odometry: Option<WheelOdometry> = None;
     let mut last_truth = None;
+    let (mut est_trail, mut truth_trail) = (Vec::new(), Vec::new());
     for entry in &recording.entries {
         match entry {
-            Entry::Truth { pose, .. } => {
-                let odo = odometry
-                    .get_or_insert_with(|| WheelOdometry::new(*pose, config.drive.wheel_base_m));
+            Entry::Truth { t_ns, pose } => {
+                let odo = odometry.get_or_insert_with(|| {
+                    est_trail.push((*t_ns, *pose));
+                    WheelOdometry::new(*pose, config.drive.wheel_base_m)
+                });
                 last_truth = Some((*pose, odo.pose));
+                truth_trail.push((*t_ns, *pose));
             }
             Entry::Msg(robot::Stamped {
+                t_ns,
                 msg: Msg::Wheels(w),
                 ..
             }) => {
                 if let Some(odo) = &mut odometry {
-                    odo.update(*w);
+                    est_trail.push((*t_ns, odo.update(*w)));
                 }
             }
             _ => {}
@@ -251,6 +256,48 @@ async fn replay(config: RobotConfig, path: PathBuf) -> Result<()> {
             (est.x - truth.x).hypot(est.y - truth.y),
             heading.to_degrees()
         );
+        score(&est_trail, &truth_trail);
     }
     Ok(())
+}
+
+/// Grades the odometry trail against the camera's: ATE as recorded (both
+/// start at the first sighting), ATE after the best rigid alignment (shape
+/// error only), and RPE (drift per stretch of true travel).
+fn score(est: &[(u64, Pose2)], truth: &[(u64, Pose2)]) {
+    use slam::eval;
+    // Wheel stamps come every 100 ms or so; a longer hole means the stream
+    // dropped and interpolating across it would invent a path.
+    let mut est = est.to_vec();
+    est.sort_by_key(|e| e.0);
+    let pairs = eval::associate(&est, truth, 300_000_000);
+    let Some(raw) = eval::ate(&pairs, Pose2::default()) else {
+        println!("  no camera poses overlap the odometry, so nothing to score");
+        return;
+    };
+    let line = |name: &str, a: &eval::Ate| {
+        println!(
+            "  ATE {name}: rmse {:.3} m, max {:.3} m, heading rmse {:.1} deg over {} poses",
+            a.rmse_m,
+            a.max_m,
+            a.heading_rmse_rad.to_degrees(),
+            a.pairs
+        )
+    };
+    line("as recorded", &raw);
+    if let Some(aligned) = eval::align(&pairs).and_then(|m| eval::ate(&pairs, m)) {
+        line("aligned", &aligned);
+    }
+    for over in [0.5, 1.0] {
+        if let Some(r) = eval::rpe(&pairs, over) {
+            println!(
+                "  RPE per {:.1} m: rmse {:.3} m ({:.1}%), heading rmse {:.1} deg over {} stretches",
+                r.over_m,
+                r.rmse_m,
+                100.0 * r.rmse_m / r.over_m,
+                r.heading_rmse_rad.to_degrees(),
+                r.stretches
+            );
+        }
+    }
 }
