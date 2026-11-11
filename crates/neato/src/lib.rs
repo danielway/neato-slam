@@ -5,7 +5,7 @@
 //! does no I/O, so it can be tested without hardware.
 //!
 //! Formats follow Neato's programmer manual. The test fixtures are written
-//! from that manual, not captured from Daniel's robot yet, so check them
+//! from that manual, not captured from the robot yet, so check them
 //! against real output once `pi-node` can talk to it.
 
 use std::fmt;

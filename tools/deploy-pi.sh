@@ -4,10 +4,16 @@
 #
 #   tools/deploy-pi.sh [user@host]
 #
+# With no argument it uses $NEATO_PI (for example, set it in ~/.profile).
+#
 # The previous binary is kept on the Pi as pi-node.prev.
 set -euo pipefail
 
-host="${1:-danielway@192.168.4.61}"
+host="${1:-${NEATO_PI:-}}"
+if [ -z "$host" ]; then
+  echo "usage: $0 user@host (or set NEATO_PI)" >&2
+  exit 2
+fi
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$repo/target/aarch64-unknown-linux-musl/release/pi-node"
 
