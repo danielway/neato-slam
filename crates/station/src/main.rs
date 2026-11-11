@@ -27,7 +27,8 @@ const ROBOT_TOML: &str = include_str!("../../../robot.toml");
 const USAGE: &str =
     "usage: station [--listen 127.0.0.1:8080] [--recordings DIR] [--camera /dev/video0]
        station --headless
-       station --replay FILE.mcap";
+       station --replay FILE.mcap
+       station --csv FILE.mcap > run.csv";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,6 +42,7 @@ async fn main() -> Result<()> {
         match arg.as_str() {
             "--headless" => return headless(config, start).await,
             "--replay" => return replay(config, args.next().context(USAGE)?.into()).await,
+            "--csv" => return csv(args.next().context(USAGE)?.into()),
             "--listen" => listen = args.next().context(USAGE)?,
             "--recordings" => recordings = args.next().context(USAGE)?.into(),
             "--camera" => camera = Some(args.next().context(USAGE)?),
@@ -74,6 +76,41 @@ async fn main() -> Result<()> {
     let (frames_tx, frames) = watch::channel(Arc::<str>::from("{}"));
     tokio::spawn(session::run(session, controls, frames_tx));
     http::serve(listener, controls_tx, frames, recordings, topdown).await
+}
+
+/// Prints a recording's wheels, commands and camera poses as CSV, one row
+/// per entry in source time, for plotting elsewhere: `t_s,kind,a,b,c` where
+/// wheels are left/right mm, a command is left/right mm/s (a stop is 0,0),
+/// and truth is x/y metres and heading radians.
+fn csv(path: PathBuf) -> Result<()> {
+    let recording =
+        Recording::read_file(&path).with_context(|| format!("reading {}", path.display()))?;
+    let t0 = recording.span_ns().map_or(0, |(a, _)| a);
+    let mut entries: Vec<&Entry> = recording.entries.iter().collect();
+    entries.sort_by_key(|e| e.t_ns());
+    println!("t_s,kind,a,b,c");
+    for entry in entries {
+        let t = entry.t_ns().saturating_sub(t0) as f64 * 1e-9;
+        match entry {
+            Entry::Msg(robot::Stamped {
+                msg: Msg::Wheels(w),
+                ..
+            }) => println!("{t:.4},wheels,{},{},", w.left_mm, w.right_mm),
+            Entry::Command { command, .. } => match command {
+                Command::WheelSpeeds {
+                    left_mm_s,
+                    right_mm_s,
+                } => println!("{t:.4},command,{left_mm_s},{right_mm_s},"),
+                Command::Stop => println!("{t:.4},command,0,0,"),
+                _ => {}
+            },
+            Entry::Truth { pose, .. } => {
+                println!("{t:.4},truth,{:.4},{:.4},{:.4}", pose.x, pose.y, pose.theta)
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The taped arena's corners from `arena.toml`, clockwise from top left.
