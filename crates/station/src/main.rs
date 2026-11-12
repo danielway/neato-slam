@@ -28,7 +28,8 @@ const USAGE: &str =
     "usage: station [--listen 127.0.0.1:8080] [--recordings DIR] [--camera /dev/video0]
        station --headless
        station --replay FILE.mcap
-       station --csv FILE.mcap > run.csv";
+       station --csv FILE.mcap > run.csv
+       station --headings FILE.mcap > headings.csv";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +44,7 @@ async fn main() -> Result<()> {
             "--headless" => return headless(config, start).await,
             "--replay" => return replay(config, args.next().context(USAGE)?.into()).await,
             "--csv" => return csv(args.next().context(USAGE)?.into()),
+            "--headings" => return headings(config, args.next().context(USAGE)?.into()),
             "--listen" => listen = args.next().context(USAGE)?,
             "--recordings" => recordings = args.next().context(USAGE)?.into(),
             "--camera" => camera = Some(args.next().context(USAGE)?),
@@ -111,6 +113,111 @@ fn csv(path: PathBuf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Heading three ways, for checking lidar timing: from the camera, from
+/// wheel odometry, and from the lidar alone, by turning each scan until it
+/// best matches the first one. Only meaningful while the robot turns on the
+/// spot. Prints CSV `t_s,source,heading_rad` with every heading unwrapped
+/// and measured from its own value at the first scan.
+fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
+    let recording =
+        Recording::read_file(&path).with_context(|| format!("reading {}", path.display()))?;
+    let t0 = recording.span_ns().map_or(0, |(a, _)| a);
+    let mut entries: Vec<&Entry> = recording.entries.iter().collect();
+    entries.sort_by_key(|e| e.t_ns());
+    let mut odometry = WheelOdometry::new(Pose2::default(), config.drive.wheel_base_m);
+    let mut reference: Option<Vec<f32>> = None;
+    let (mut lidar, mut camera, mut wheels) =
+        (Unwrap::default(), Unwrap::default(), Unwrap::default());
+    println!("t_s,source,heading_rad");
+    for entry in entries {
+        let t = entry.t_ns().saturating_sub(t0) as f64 * 1e-9;
+        match entry {
+            Entry::Msg(robot::Stamped {
+                msg: Msg::Wheels(w),
+                ..
+            }) => {
+                let theta = odometry.update(*w).theta;
+                println!("{t:.4},wheels,{:.4}", wheels.next(theta));
+            }
+            Entry::Msg(robot::Stamped {
+                msg: Msg::Lidar(scan),
+                ..
+            }) => match &reference {
+                None => {
+                    reference = Some(scan.ranges.clone());
+                    println!("{t:.4},lidar,{:.4}", lidar.next(0.0));
+                }
+                Some(first) => {
+                    if let Some(turn) = best_turn(first, &scan.ranges, scan.angle_increment) {
+                        println!("{t:.4},lidar,{:.4}", lidar.next(turn));
+                    }
+                }
+            },
+            Entry::Truth { pose, .. } => println!("{t:.4},camera,{:.4}", camera.next(pose.theta)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Makes an angle series continuous and starts it at zero.
+#[derive(Default)]
+struct Unwrap {
+    first: Option<f64>,
+    last: f64,
+    total: f64,
+}
+
+impl Unwrap {
+    fn next(&mut self, theta: f64) -> f64 {
+        match self.first {
+            None => {
+                self.first = Some(theta);
+                self.last = theta;
+            }
+            Some(_) => {
+                let d = theta - self.last;
+                self.total += d.sin().atan2(d.cos());
+                self.last = theta;
+            }
+        }
+        self.total
+    }
+}
+
+/// How far the robot has turned since `first`, from the beam shift that
+/// best lines `scan` up with it (scan[i] sees what first[i + k] saw), with a
+/// parabola through the best shift for sub-beam precision.
+fn best_turn(first: &[f32], scan: &[f32], increment: f32) -> Option<f64> {
+    let n = first.len();
+    if n == 0 || scan.len() != n {
+        return None;
+    }
+    let cost = |k: usize| {
+        let (mut sum, mut count) = (0.0f64, 0usize);
+        for i in 0..n {
+            let (a, b) = (scan[i], first[(i + k) % n]);
+            if a.is_finite() && b.is_finite() {
+                sum += (a - b).abs().min(0.5) as f64;
+                count += 1;
+            }
+        }
+        (count > n / 4).then(|| sum / count as f64)
+    };
+    let costs: Vec<Option<f64>> = (0..n).map(cost).collect();
+    let (k, &best) = costs
+        .iter()
+        .enumerate()
+        .filter_map(|(k, c)| c.as_ref().map(|c| (k, c)))
+        .min_by(|a, b| a.1.total_cmp(b.1))?;
+    let (before, after) = (costs[(k + n - 1) % n], costs[(k + 1) % n]);
+    let shift = match (before, after) {
+        (Some(a), Some(b)) if a + b - 2.0 * best > 1e-12 => 0.5 * (a - b) / (a + b - 2.0 * best),
+        _ => 0.0,
+    };
+    Some((k as f64 + shift) * increment as f64)
 }
 
 /// The taped arena's corners from `arena.toml`, clockwise from top left.
