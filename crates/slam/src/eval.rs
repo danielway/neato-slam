@@ -189,8 +189,75 @@ pub fn rpe(pairs: &[(Pose2, Pose2)], over_m: f64) -> Option<Rpe> {
     })
 }
 
+/// How much later than its stamps the truth actually happened, in
+/// nanoseconds (negative if earlier), fitted by lining up how fast the
+/// heading changes in the truth and in the estimate. The camera's delay
+/// varies from run to run (light, load), and a truth that runs late counts
+/// as error the estimate doesn't have. Heading rate is used, not heading,
+/// so the estimate's slow drift doesn't pull the fit. Searches -100 to +200
+/// ms in 2 ms steps. `None` if the robot barely turned, which leaves the
+/// delay unmeasurable.
+pub fn truth_lag(est: &[Timed], truth: &[Timed]) -> Option<i64> {
+    const STEP_MS: i64 = 2;
+    let turned: f64 = truth
+        .windows(2)
+        .map(|w| {
+            Pose2::new(0.0, 0.0, w[1].1.theta - w[0].1.theta)
+                .theta
+                .abs()
+        })
+        .sum();
+    if turned < 0.5 {
+        return None;
+    }
+    let cost = |lag_ns: i64| -> Option<f64> {
+        let shifted: Vec<Timed> = truth
+            .iter()
+            .filter_map(|&(t, p)| u64::try_from(t as i64 - lag_ns).ok().map(|t| (t, p)))
+            .collect();
+        // Truth comes faster than the estimate, so it is the one
+        // interpolated, at the estimate's stamps.
+        let pairs = associate(&shifted, est, 300_000_000);
+        if pairs.len() < 20 {
+            return None;
+        }
+        let sum: f64 = pairs
+            .windows(2)
+            .map(|w| {
+                let d_est = Pose2::new(0.0, 0.0, w[1].0.theta - w[0].0.theta).theta;
+                let d_truth = Pose2::new(0.0, 0.0, w[1].1.theta - w[0].1.theta).theta;
+                (d_est - d_truth).powi(2)
+            })
+            .sum();
+        Some(sum / (pairs.len() - 1) as f64)
+    };
+    (-100 / STEP_MS..=200 / STEP_MS)
+        .map(|k| k * STEP_MS * 1_000_000)
+        .filter_map(|lag| cost(lag).map(|c| (lag, c)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(lag, _)| lag)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn truth_lag_finds_a_late_camera() {
+        // A robot turning back and forth; the camera sees each pose 60 ms
+        // late, and the estimate reads 3% short.
+        let heading = |t: f64| (t * 1.3).sin() * 1.5;
+        let ns = |t: f64| (t * 1e9) as u64;
+        let est: Vec<Timed> = (0..200)
+            .map(|i| i as f64 * 0.1)
+            .map(|t| (ns(t), Pose2::new(0.0, 0.0, 0.97 * heading(t))))
+            .collect();
+        let truth: Vec<Timed> = (0..600)
+            .map(|i| i as f64 / 30.0)
+            .map(|t| (ns(t + 0.06), Pose2::new(0.0, 0.0, heading(t))))
+            .collect();
+        let lag = truth_lag(&est, &truth).unwrap();
+        assert!((lag - 60_000_000).abs() <= 4_000_000, "{lag}");
+    }
     use super::*;
 
     fn close(a: f64, b: f64) -> bool {

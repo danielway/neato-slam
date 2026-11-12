@@ -513,7 +513,22 @@ fn score(est: &[(u64, Pose2)], truth: &[(u64, Pose2)]) {
     // dropped and interpolating across it would invent a path.
     let mut est = est.to_vec();
     est.sort_by_key(|e| e.0);
-    let pairs = eval::associate(&est, truth, 300_000_000);
+    // The camera's delay drifts from run to run, so it is fitted to this
+    // run and taken out before scoring.
+    let truth: Vec<(u64, Pose2)> = match eval::truth_lag(&est, truth) {
+        Some(lag) => {
+            println!(
+                "  camera runs {:+.0} ms late beyond camera.toml's latency, taken out below",
+                lag as f64 * 1e-6
+            );
+            truth
+                .iter()
+                .filter_map(|&(t, p)| u64::try_from(t as i64 - lag).ok().map(|t| (t, p)))
+                .collect()
+        }
+        None => truth.to_vec(),
+    };
+    let pairs = eval::associate(&est, &truth, 300_000_000);
     let Some(raw) = eval::ate(&pairs, Pose2::default()) else {
         println!("  no camera poses overlap the odometry, so nothing to score");
         return;
