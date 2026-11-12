@@ -13,8 +13,10 @@
 //! Driving: the station sends wheel speeds, re-sent while its keys are
 //! held. Each tick, the latest one becomes a `SetMotor` that moves each
 //! wheel the distance it would cover in `--horizon-ms` at that speed, so the
-//! next tick's move replaces it before it runs out. If no command arrives
-//! for `WATCHDOG`, or the station goes away, the wheels are stopped.
+//! next tick's move replaces it before it runs out. A changed command (a
+//! new speed, or a stop) goes out as soon as the serial port is free rather
+//! than at the next tick. If no command arrives for `WATCHDOG`, or the
+//! station goes away, the wheels are stopped.
 //!
 //! The station can also switch the lidar off, and take the Neato out of
 //! test mode so it charges on its dock. Out of test mode the wheels and
@@ -37,7 +39,7 @@ use robot::{Command, Msg, Stamped};
 
 use crate::port::NeatoPort;
 
-const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878] [--tick-ms 100] [--horizon-ms 300] [--stop zero|tiny|disable]";
+const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878] [--tick-ms 100] [--horizon-ms 300] [--stop disable|tiny|zero]";
 
 /// Wheels and bumpers are polled every tick, the lidar every other tick and
 /// the battery every tenth. Settable with `--tick-ms`.
@@ -67,7 +69,7 @@ fn main() -> Result<()> {
             v.context(USAGE)?.parse().context(USAGE)?,
         ))
     };
-    let mut stop_style = StopStyle::Zero;
+    let mut stop_style = StopStyle::Disable;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -145,8 +147,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// How a stop is sent. The firmware seems to finish the move in progress
-/// after a zero `SetMotor`, so the others are on trial (milestone 1 spike).
+/// How a stop is sent. The firmware finishes the move in progress after a
+/// zero `SetMotor`, so a stop ran on for the whole horizon (about 45 mm at
+/// 150 mm/s). Measured 2026-11-12: zero 30-46 mm, tiny 12-28 mm (and a 1 mm
+/// creep while idle), disable 9-16 mm. Disable is the default.
 #[derive(Debug, Clone, Copy)]
 enum StopStyle {
     /// `SetMotor 0 0 0`.
@@ -209,7 +213,7 @@ impl Robot {
             lidar_on: false,
             moving: false,
             test_mode: false,
-            stop_style: StopStyle::Zero,
+            stop_style: StopStyle::Disable,
             last_attempt: None,
             last_error: String::new(),
         }
@@ -386,12 +390,13 @@ fn serve(
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let connected = Arc::new(AtomicBool::new(true));
     let latest: Latest = Arc::default();
+    let (wake_tx, wake) = mpsc::channel();
     let reader = {
         let stream = stream.try_clone()?;
         let connected = connected.clone();
         let latest = latest.clone();
         thread::spawn(move || {
-            if let Err(e) = read_commands(stream, &latest) {
+            if let Err(e) = read_commands(stream, &latest, &wake_tx) {
                 eprintln!("command stream ended: {e}");
             }
             connected.store(false, Ordering::Relaxed);
@@ -425,18 +430,39 @@ fn serve(
                 scan: scanning && tick % SCAN_EVERY_TICKS == 0,
                 charger: tick % CHARGER_EVERY_TICKS == 0,
             };
-            if let Err(e) = poll_once(robot, &mut stream, clock, &mut seq, polls) {
+            let mut between = |robot: &mut Robot| drive_if_changed(robot, &wake, &latest, timing);
+            if let Err(e) = poll_once(robot, &mut stream, clock, &mut seq, polls, &mut between) {
                 break Err(e);
             }
             tick = tick.wrapping_add(1);
         }
-        if let Some(rest) = timing.tick.checked_sub(started.elapsed()) {
-            thread::sleep(rest);
+        // Sleep out the tick, but send a changed command the moment it
+        // arrives.
+        while let Some(rest) = timing.tick.checked_sub(started.elapsed()) {
+            match wake.recv_timeout(rest) {
+                Ok(()) => drive_now(robot, &wake, &latest, timing),
+                Err(_) => break,
+            }
         }
     };
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = reader.join();
     result
+}
+
+/// Sends the newest drive command now, if one arrived since the last check.
+fn drive_if_changed(robot: &mut Robot, wake: &Receiver<()>, latest: &Latest, timing: Timing) {
+    if wake.try_recv().is_ok() {
+        drive_now(robot, wake, latest, timing);
+    }
+}
+
+fn drive_now(robot: &mut Robot, wake: &Receiver<()>, latest: &Latest, timing: Timing) {
+    while wake.try_recv().is_ok() {}
+    let wanted = *latest.lock().unwrap();
+    if wanted.test_mode && robot.port.is_some() {
+        robot.drive(wanted, timing.horizon);
+    }
 }
 
 #[derive(Default)]
@@ -468,6 +494,7 @@ fn poll_once(
     clock: Instant,
     seq: &mut Seqs,
     polls: Polls,
+    between: &mut dyn FnMut(&mut Robot),
 ) -> Result<()> {
     let mut out = Vec::with_capacity(4);
 
@@ -483,6 +510,7 @@ fn poll_once(
         }
     }
 
+    between(robot);
     let t = stamp(clock);
     if let Some(reply) = robot.query(cmd::GET_DIGITAL_SENSORS) {
         match neato::parse_digital_sensors(&reply) {
@@ -495,6 +523,7 @@ fn poll_once(
         }
     }
 
+    between(robot);
     if polls.scan {
         let t = stamp(clock);
         if let Some(reply) = robot.query(cmd::GET_LDS_SCAN) {
@@ -508,6 +537,7 @@ fn poll_once(
             }
         }
     }
+    between(robot);
 
     if polls.charger {
         let t = stamp(clock);
@@ -541,7 +571,11 @@ fn log_bad_reply(command: &str, err: &neato::ParseError, reply: &str) {
 }
 
 /// Keeps the station's latest command in `latest` until it disconnects.
-fn read_commands(mut stream: TcpStream, latest: &Latest) -> io::Result<()> {
+fn read_commands(
+    mut stream: TcpStream,
+    latest: &Latest,
+    wake: &mpsc::Sender<()>,
+) -> io::Result<()> {
     loop {
         let mut len = [0u8; 4];
         match stream.read_exact(&mut len) {
@@ -564,8 +598,14 @@ fn read_commands(mut stream: TcpStream, latest: &Latest) -> io::Result<()> {
                     Command::Lidar { on } => wanted.lidar = on,
                     Command::TestMode { on } => wanted.test_mode = on,
                     drive => {
+                        let changed = wanted.drive != drive;
                         wanted.drive = drive;
                         wanted.at = Instant::now();
+                        if changed {
+                            // A new speed or a stop goes out between serial
+                            // exchanges instead of waiting for the next tick.
+                            let _ = wake.send(());
+                        }
                     }
                 }
             }
