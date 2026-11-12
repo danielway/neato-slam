@@ -127,7 +127,7 @@ fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
     let mut entries: Vec<&Entry> = recording.entries.iter().collect();
     entries.sort_by_key(|e| e.t_ns());
     let mut odometry = WheelOdometry::new(Pose2::default(), config.drive.wheel_base_m);
-    let mut reference: Option<Vec<f32>> = None;
+    let mut reference: Option<robot::LidarScan> = None;
     let (mut lidar, mut camera, mut wheels) =
         (Unwrap::default(), Unwrap::default(), Unwrap::default());
     println!("t_s,source,heading_rad");
@@ -146,11 +146,11 @@ fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
                 ..
             }) => match &reference {
                 None => {
-                    reference = Some(scan.ranges.clone());
+                    reference = Some(scan.clone());
                     println!("{t:.4},lidar,{:.4}", lidar.next(0.0));
                 }
                 Some(first) => {
-                    if let Some(turn) = best_turn(first, &scan.ranges, scan.angle_increment) {
+                    if let Some(turn) = best_turn(first, scan, &config.lidar) {
                         println!("{t:.4},lidar,{:.4}", lidar.next(turn));
                     }
                 }
@@ -187,37 +187,59 @@ impl Unwrap {
     }
 }
 
-/// How far the robot has turned since `first`, from the beam shift that
-/// best lines `scan` up with it (scan[i] sees what first[i + k] saw), with a
-/// parabola through the best shift for sub-beam precision.
-fn best_turn(first: &[f32], scan: &[f32], increment: f32) -> Option<f64> {
-    let n = first.len();
-    if n == 0 || scan.len() != n {
+/// How far the robot has turned on the spot since `first`: the turn about
+/// the robot's centre that best carries the points `first` saw onto what
+/// `scan` sees. The lidar sits off the centre, so a turn also moves it and
+/// a plain shift of the beams would be biased. Searched in 1 degree steps,
+/// then 0.05 degree steps around the best.
+fn best_turn(
+    first: &robot::LidarScan,
+    scan: &robot::LidarScan,
+    mount: &robot::LidarConfig,
+) -> Option<f64> {
+    let lidar = Pose2::new(mount.x_m, mount.y_m, mount.theta_rad);
+    let points: Vec<(f64, f64)> = first
+        .ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_finite())
+        .map(|(i, &r)| {
+            let a = (first.angle_min + i as f32 * first.angle_increment) as f64;
+            lidar.transform_point(r as f64 * a.cos(), r as f64 * a.sin())
+        })
+        .collect();
+    let n = scan.ranges.len();
+    if points.len() < 30 || n == 0 {
         return None;
     }
-    let cost = |k: usize| {
-        let (mut sum, mut count) = (0.0f64, 0usize);
-        for i in 0..n {
-            let (a, b) = (scan[i], first[(i + k) % n]);
-            if a.is_finite() && b.is_finite() {
-                sum += (a - b).abs().min(0.5) as f64;
+    let inc = scan.angle_increment as f64;
+    let cost = |turn: f64| -> Option<f64> {
+        let (s, c) = (-turn).sin_cos();
+        let (mut sum, mut count) = (0.0, 0usize);
+        for &(x, y) in &points {
+            // Where the point sits after the robot turned, seen from the
+            // lidar.
+            let (rx, ry) = (c * x - s * y - lidar.x, s * x + c * y - lidar.y);
+            let a = ry.atan2(rx) - lidar.theta - scan.angle_min as f64;
+            let k = (a / inc).round().rem_euclid(n as f64) as usize % n;
+            let r = scan.ranges[k];
+            if r.is_finite() {
+                sum += (r as f64 - rx.hypot(ry)).abs().min(0.3);
                 count += 1;
             }
         }
-        (count > n / 4).then(|| sum / count as f64)
+        (count > points.len() / 3).then(|| sum / count as f64)
     };
-    let costs: Vec<Option<f64>> = (0..n).map(cost).collect();
-    let (k, &best) = costs
-        .iter()
-        .enumerate()
-        .filter_map(|(k, c)| c.as_ref().map(|c| (k, c)))
-        .min_by(|a, b| a.1.total_cmp(b.1))?;
-    let (before, after) = (costs[(k + n - 1) % n], costs[(k + 1) % n]);
-    let shift = match (before, after) {
-        (Some(a), Some(b)) if a + b - 2.0 * best > 1e-12 => 0.5 * (a - b) / (a + b - 2.0 * best),
-        _ => 0.0,
+    let search = |from: f64, to: f64, step: f64| {
+        let steps = ((to - from) / step).round() as usize;
+        (0..=steps)
+            .map(|i| from + i as f64 * step)
+            .filter_map(|t| cost(t).map(|c| (t, c)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
     };
-    Some((k as f64 + shift) * increment as f64)
+    let deg = std::f64::consts::PI / 180.0;
+    let (coarse, _) = search(-180.0 * deg, 179.0 * deg, deg)?;
+    search(coarse - deg, coarse + deg, 0.05 * deg).map(|(t, _)| t)
 }
 
 /// The taped arena's corners from `arena.toml`, clockwise from top left.
@@ -446,6 +468,48 @@ fn score(est: &[(u64, Pose2)], truth: &[(u64, Pose2)]) {
                 r.heading_rmse_rad.to_degrees(),
                 r.stretches
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scan of an off-centre box from a robot at `pose`, lidar mounted
+    /// behind the centre as on the Neato.
+    fn scan_at(world: &World, mount: &robot::LidarConfig, pose: Pose2) -> robot::LidarScan {
+        let lidar = pose.compose(&Pose2::new(mount.x_m, mount.y_m, mount.theta_rad));
+        let inc = std::f32::consts::TAU / 360.0;
+        let ranges = (0..360)
+            .map(|i| {
+                let a = lidar.theta + (i as f32 * inc) as f64;
+                world
+                    .raycast((lidar.x, lidar.y), a, 6.0)
+                    .map_or(f32::NAN, |r| r as f32)
+            })
+            .collect();
+        robot::LidarScan {
+            angle_min: 0.0,
+            angle_increment: inc,
+            ranges,
+            intensities: None,
+            scan_duration: 0.2,
+        }
+    }
+
+    #[test]
+    fn best_turn_recovers_a_turn_on_the_spot() {
+        let config = RobotConfig::from_toml_str(ROBOT_TOML).unwrap();
+        let world = World::rectangle(3.6, 1.8);
+        let start = Pose2::new(2.1, 0.7, 0.3);
+        let first = scan_at(&world, &config.lidar, start);
+        for turn in [0.2_f64, 1.0, 2.4, -1.3] {
+            let now = Pose2::new(start.x, start.y, start.theta + turn);
+            let scan = scan_at(&world, &config.lidar, now);
+            let got = best_turn(&first, &scan, &config.lidar).unwrap();
+            let err = (got - turn).sin().atan2((got - turn).cos());
+            assert!(err.abs() < 0.01, "turn {turn}: got {got}");
         }
     }
 }
