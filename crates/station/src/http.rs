@@ -57,7 +57,10 @@ async fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Opti
     }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
-    let path = parts.next().unwrap_or_default().to_owned();
+    // The page keeps its settings in the query string (`/?source=real&…`),
+    // which only the page reads; routes match the path alone.
+    let target = parts.next().unwrap_or_default();
+    let path = target.split('?').next().unwrap_or_default().to_owned();
 
     let mut head_len = line.len();
     let (mut content_length, mut json) = (0, false);
