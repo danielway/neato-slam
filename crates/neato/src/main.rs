@@ -37,7 +37,7 @@ use robot::{Command, Msg, Stamped};
 
 use crate::port::NeatoPort;
 
-const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878] [--tick-ms 100] [--horizon-ms 300]";
+const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878] [--tick-ms 100] [--horizon-ms 300] [--stop zero|tiny|disable]";
 
 /// Wheels and bumpers are polled every tick, the lidar every other tick and
 /// the battery every tenth. Settable with `--tick-ms`.
@@ -67,6 +67,7 @@ fn main() -> Result<()> {
             v.context(USAGE)?.parse().context(USAGE)?,
         ))
     };
+    let mut stop_style = StopStyle::Zero;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -74,6 +75,14 @@ fn main() -> Result<()> {
             "--listen" => listen = args.next().context(USAGE)?,
             "--tick-ms" => timing.tick = ms(args.next())?,
             "--horizon-ms" => timing.horizon = ms(args.next())?,
+            "--stop" => {
+                stop_style = match args.next().as_deref() {
+                    Some("zero") => StopStyle::Zero,
+                    Some("tiny") => StopStyle::Tiny,
+                    Some("disable") => StopStyle::Disable,
+                    _ => bail!("{USAGE}"),
+                }
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -87,6 +96,8 @@ fn main() -> Result<()> {
         timing.tick, timing.horizon
     );
     let mut robot = Robot::new(serial);
+    robot.stop_style = stop_style;
+    eprintln!("stopping with {stop_style:?}");
     robot.try_open();
 
     let listener = TcpListener::bind(&listen).with_context(|| format!("listening on {listen}"))?;
@@ -134,6 +145,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// How a stop is sent. The firmware seems to finish the move in progress
+/// after a zero `SetMotor`, so the others are on trial (milestone 1 spike).
+#[derive(Debug, Clone, Copy)]
+enum StopStyle {
+    /// `SetMotor 0 0 0`.
+    Zero,
+    /// A 1 mm move at 1 mm/s, which should replace the move in progress.
+    Tiny,
+    /// Disable both wheel motors, then enable them again.
+    Disable,
+}
+
 #[derive(Clone, Copy)]
 struct Timing {
     tick: Duration,
@@ -172,6 +195,7 @@ struct Robot {
     moving: bool,
     /// Whether the Neato is in test mode, which `open_and_greet` turns on.
     test_mode: bool,
+    stop_style: StopStyle,
     last_attempt: Option<Instant>,
     /// The last open failure printed, so retries every 2 s don't flood the log.
     last_error: String,
@@ -185,6 +209,7 @@ impl Robot {
             lidar_on: false,
             moving: false,
             test_mode: false,
+            stop_style: StopStyle::Zero,
             last_attempt: None,
             last_error: String::new(),
         }
@@ -307,7 +332,18 @@ impl Robot {
     }
 
     fn stop(&mut self) {
-        if self.moving && self.query(&cmd::set_motor(0, 0, 0)).is_some() {
+        if !self.moving {
+            return;
+        }
+        let sent = match self.stop_style {
+            StopStyle::Zero => self.query(&cmd::set_motor(0, 0, 0)).is_some(),
+            StopStyle::Tiny => self.query(&cmd::set_motor(1, 1, 1)).is_some(),
+            StopStyle::Disable => {
+                let off = self.query(cmd::WHEELS_DISABLE).is_some();
+                off && self.query(cmd::WHEELS_ENABLE).is_some()
+            }
+        };
+        if sent {
             self.moving = false;
         }
     }

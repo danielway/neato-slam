@@ -41,6 +41,9 @@ pub mod cmd {
 
     /// Drives each wheel a distance in mm at up to `speed_mm_s`. A zero
     /// distance on both wheels stops the robot.
+    pub const WHEELS_DISABLE: &str = "SetMotor LWheelDisable RWheelDisable";
+    pub const WHEELS_ENABLE: &str = "SetMotor LWheelEnable RWheelEnable";
+
     pub fn set_motor(left_mm: i32, right_mm: i32, speed_mm_s: u32) -> String {
         format!("SetMotor LWheelDist {left_mm} RWheelDist {right_mm} Speed {speed_mm_s}")
     }
