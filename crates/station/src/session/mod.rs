@@ -40,6 +40,7 @@ use readings::Readings;
 use real::{Link, RETRY_AFTER, RealEvent, RealRun};
 use replay::ReplayRun;
 use sim::SimRun;
+pub use sim::demo_world;
 use tape::Tape;
 
 /// How often frames go out to the page.
@@ -100,6 +101,8 @@ enum Source {
 pub struct Session {
     config: RobotConfig,
     start: Pose2,
+    /// The simulator's walls.
+    world: ::sim::World,
     source: Source,
     /// Bumped on every reset or switch, so the page knows to clear trails.
     run: u64,
@@ -130,9 +133,10 @@ struct DriveTestRun {
 impl Session {
     pub fn new(config: RobotConfig, start: Pose2, recordings: PathBuf) -> Self {
         Self {
-            source: Source::Sim(SimRun::new(&config, start)),
+            source: Source::Sim(SimRun::new(&demo_world(), &config, start)),
             config,
             start,
+            world: demo_world(),
             run: 0,
             keys: Keys::default(),
             keys_at: Instant::now(),
@@ -144,6 +148,14 @@ impl Session {
             test: None,
             arena: Vec::new(),
         }
+    }
+
+    /// Simulates this world instead of the demo room, starting at `start`.
+    pub fn with_world(mut self, world: ::sim::World, start: Pose2) -> Self {
+        self.source = Source::Sim(SimRun::new(&world, &self.config, start));
+        self.world = world;
+        self.start = start;
+        self
     }
 
     /// Takes the real robot's true pose from the ceiling camera, over the
@@ -220,7 +232,7 @@ impl Session {
             Control::Use { backend } => {
                 self.end_test();
                 let source = match backend {
-                    Backend::Sim => Source::Sim(SimRun::new(&self.config, self.start)),
+                    Backend::Sim => Source::Sim(SimRun::new(&self.world, &self.config, self.start)),
                     Backend::Real { addr } => {
                         Source::Real(RealRun::connect(addr.trim().to_owned(), &self.config))
                     }
@@ -240,7 +252,7 @@ impl Session {
                         // A fresh sim starts its clock over, so it gets a
                         // fresh recording too.
                         self.tape.stop();
-                        *sim = SimRun::new(&self.config, self.start)
+                        *sim = SimRun::new(&self.world, &self.config, self.start)
                     }
                     Source::Real(real) => {
                         let start = self.camera.as_ref().and_then(CameraFeed::fresh);

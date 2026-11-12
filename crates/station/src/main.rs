@@ -71,6 +71,13 @@ async fn main() -> Result<()> {
         recordings.display()
     );
     let mut session = session::Session::new(config, start, recordings.clone());
+    if let Some((world, start)) = arena_world("arena.toml")? {
+        println!(
+            "station: the sim is the arena in arena.toml, {} walls",
+            world.segments.len()
+        );
+        session = session.with_world(world, start);
+    }
     let mut topdown = None;
     if let Some(device) = camera {
         let arena = arena_corners("arena.toml")?;
@@ -333,6 +340,48 @@ fn arena_corners(path: &str) -> Result<Vec<[f64; 2]>> {
                 .with_context(|| format!("{path} has no corners.{k}"))
         })
         .collect()
+}
+
+/// The arena as the sim should build it: the tape as walls, plus every
+/// `[[obstacle]]` as a closed outline, and the `[sim]` start pose. `None`
+/// when there is no such file or it has no `[sim]` section.
+fn arena_world(path: &str) -> Result<Option<(World, Pose2)>> {
+    #[derive(serde::Deserialize)]
+    struct Arena {
+        sim: Option<SimStart>,
+        #[serde(default)]
+        obstacle: Vec<Obstacle>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SimStart {
+        start: [f64; 3],
+    }
+    #[derive(serde::Deserialize)]
+    struct Obstacle {
+        corners: Vec<[f64; 2]>,
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {path}")),
+    };
+    let arena: Arena = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+    let Some(sim) = arena.sim else {
+        return Ok(None);
+    };
+    let tape = arena_corners(path)?;
+    let mut world = World::default();
+    for outline in std::iter::once(&tape).chain(arena.obstacle.iter().map(|o| &o.corners)) {
+        for (i, a) in outline.iter().enumerate() {
+            let b = outline[(i + 1) % outline.len()];
+            world.segments.push(sim::Segment {
+                a: (a[0], a[1]),
+                b: (b[0], b[1]),
+            });
+        }
+    }
+    let [x, y, theta] = sim.start;
+    Ok(Some((world, Pose2::new(x, y, theta))))
 }
 
 /// Drives a gentle left arc for ten simulated seconds and reports how far

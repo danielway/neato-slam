@@ -5,8 +5,9 @@ use sim::{Segment, Sim, SimBackend, World};
 use super::readings::Readings;
 use super::tape::Tape;
 
-/// A room with a few obstacles, so scans have some structure to show.
-pub(super) fn demo_world() -> World {
+/// A room with a few obstacles, so scans have some structure to show. The
+/// sim uses it unless the station is given the arena's layout.
+pub fn demo_world() -> World {
     let mut world = World::rectangle(6.0, 4.5);
     let mut wall = |a: (f64, f64), b: (f64, f64)| world.segments.push(Segment { a, b });
     // An interior wall with a doorway.
@@ -35,9 +36,9 @@ pub(super) struct SimRun {
 }
 
 impl SimRun {
-    pub(super) fn new(config: &RobotConfig, start: Pose2) -> Self {
+    pub(super) fn new(world: &World, config: &RobotConfig, start: Pose2) -> Self {
         Self {
-            robot: SimBackend::new(Sim::new(demo_world(), config.clone(), start, 0.01)),
+            robot: SimBackend::new(Sim::new(world.clone(), config.clone(), start, 0.01)),
             readings: Readings::new(config, start),
             clock_ns: 0,
             command: Command::Stop,
