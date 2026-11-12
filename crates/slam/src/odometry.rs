@@ -18,6 +18,13 @@ impl WheelOdometry {
         }
     }
 
+    /// Forgets the previous reading, so the next one only sets the
+    /// reference: for when the counters may have jumped, such as a new
+    /// pi-node connection.
+    pub fn rebase(&mut self) {
+        self.last = None;
+    }
+
     /// Integrates the travel since the previous reading. The first reading
     /// only sets the reference.
     pub fn update(&mut self, wheels: WheelPositions) -> Pose2 {

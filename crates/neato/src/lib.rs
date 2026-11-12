@@ -61,6 +61,38 @@ pub mod cmd {
     }
 }
 
+/// Keeps reported wheel positions continuous across the Neato's counter
+/// resets. Its counters go back to zero when test mode is switched, so after
+/// [`rebase`](Self::rebase) the next reading is taken to continue from the
+/// last one reported (the robot is still while test mode changes).
+#[derive(Debug, Default)]
+pub struct ContinuousWheels {
+    offset: (i64, i64),
+    last: Option<WheelPositions>,
+    rebase: bool,
+}
+
+impl ContinuousWheels {
+    /// The counters may have jumped: join the next reading to the last.
+    pub fn rebase(&mut self) {
+        self.rebase = true;
+    }
+
+    pub fn next(&mut self, raw: WheelPositions) -> WheelPositions {
+        if std::mem::take(&mut self.rebase)
+            && let Some(last) = self.last
+        {
+            self.offset = (last.left_mm - raw.left_mm, last.right_mm - raw.right_mm);
+        }
+        let out = WheelPositions {
+            left_mm: raw.left_mm + self.offset.0,
+            right_mm: raw.right_mm + self.offset.1,
+        };
+        self.last = Some(out);
+        out
+    }
+}
+
 /// Whether a reply belongs to `command`. The Neato echoes each command as
 /// the first line of its reply, so a reply that echoes a different command
 /// is left over from an earlier exchange and must be skipped, or every reply
@@ -301,5 +333,19 @@ mod tests {
         assert!((s.battery_v - 15.96).abs() < 1e-4);
         assert!(s.charging);
         assert!(s.external_power);
+    }
+
+    #[test]
+    fn wheels_stay_continuous_across_a_counter_reset() {
+        let w = |l, r| WheelPositions {
+            left_mm: l,
+            right_mm: r,
+        };
+        let mut wheels = ContinuousWheels::default();
+        assert_eq!(wheels.next(w(1200, 1300)), w(1200, 1300));
+        assert_eq!(wheels.next(w(1250, 1350)), w(1250, 1350));
+        wheels.rebase();
+        assert_eq!(wheels.next(w(0, 0)), w(1250, 1350));
+        assert_eq!(wheels.next(w(10, -5)), w(1260, 1345));
     }
 }

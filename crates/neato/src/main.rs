@@ -202,6 +202,7 @@ struct Robot {
     /// Whether the Neato is in test mode, which `open_and_greet` turns on.
     test_mode: bool,
     stop_style: StopStyle,
+    wheels: neato::ContinuousWheels,
     last_attempt: Option<Instant>,
     /// The last open failure printed, so retries every 2 s don't flood the log.
     last_error: String,
@@ -216,6 +217,7 @@ impl Robot {
             moving: false,
             test_mode: false,
             stop_style: StopStyle::Disable,
+            wheels: Default::default(),
             last_attempt: None,
             last_error: String::new(),
         }
@@ -249,6 +251,7 @@ impl Robot {
             Ok(port) => {
                 self.port = Some(port);
                 self.test_mode = true;
+                self.wheels.rebase();
                 self.last_error.clear();
                 true
             }
@@ -326,6 +329,7 @@ impl Robot {
         };
         if self.query(command).is_some() {
             self.test_mode = on;
+            self.wheels.rebase();
             eprintln!(
                 "test mode {}",
                 if on {
@@ -521,7 +525,7 @@ fn poll_once(
             Ok(w) => out.push(Stamped {
                 t_ns: t,
                 seq: next(&mut seq.wheels),
-                msg: Msg::Wheels(w),
+                msg: Msg::Wheels(robot.wheels.next(w)),
             }),
             Err(e) => log_bad_reply(cmd::GET_MOTORS, &e, &reply),
         }

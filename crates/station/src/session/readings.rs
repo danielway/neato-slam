@@ -35,7 +35,12 @@ impl Readings {
             Msg::Lidar(scan) => self.hits = robot_frame_hits(&scan, config),
             Msg::Contacts(c) => self.contacts = c,
             Msg::Status(s) => self.status = Some(s),
-            Msg::Node(n) => self.node = Some(n),
+            Msg::Node(n) => {
+                // A new pi-node connection: its wheel counters needn't
+                // follow on from the last ones seen.
+                self.odometry.rebase();
+                self.node = Some(n);
+            }
         }
     }
 }
