@@ -49,6 +49,8 @@
   footer { display: flex; flex-wrap: wrap; gap: 4px 20px; padding: 8px 16px; background: var(--panel);
     border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
   .muted { color: var(--muted); }
+  #versions { margin-left: auto; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); align-self: center; }
+  #versions.differ { color: var(--warn); }
   .key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
 </style>
 </head>
@@ -78,6 +80,7 @@
     <button id="lidar" title="Spin the robot's lidar up or down">Lidar on</button>
     <button id="testMode" title="Out of test mode the Neato's own firmware takes over: it charges on the dock, and the wheels and lidar stop">Test mode on</button>
   </fieldset>
+  <span id="versions" title="Git commit each program was built from. Amber when the station and pi-node differ."></span>
 </header>
 <main><canvas id="view" tabindex="0"></canvas></main>
 <footer>
@@ -296,6 +299,10 @@ function render() {
     if (f.detail) parts.push(f.detail);
   }
   $("status").textContent = parts.join("   ");
+  const v = [`station ${f.version}`];
+  if (f.node) v.push(`pi-node ${f.node.version} ${f.node.settings}`);
+  $("versions").textContent = v.join("  ·  ");
+  $("versions").classList.toggle("differ", !!f.node && f.node.version !== f.version);
   $("notice").textContent = f.notice || "";
   $("help").textContent = {
     sim: "Click the map, then WASD/arrows drive, Shift fast, Space fine, P pause, R reset, O scan frame",

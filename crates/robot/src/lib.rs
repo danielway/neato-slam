@@ -40,6 +40,19 @@ pub enum Msg {
     Wheels(WheelPositions),
     Contacts(Contacts),
     Status(RobotStatus),
+    /// Who is on the other end: sent once when a station connects.
+    Node(NodeInfo),
+}
+
+/// The build and settings of the program serving a robot, so the station
+/// can show what is deployed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    /// Git commit the program was built from, with `-dirty` for
+    /// uncommitted changes.
+    pub version: String,
+    /// Its settings, as command-line flags.
+    pub settings: String,
 }
 
 /// One full lidar rotation, in the lidar's own frame.

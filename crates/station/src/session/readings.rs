@@ -1,4 +1,4 @@
-use robot::{Contacts, LidarScan, Msg, Pose2, RobotConfig, RobotStatus, Stamped};
+use robot::{Contacts, LidarScan, Msg, NodeInfo, Pose2, RobotConfig, RobotStatus, Stamped};
 use slam::odometry::WheelOdometry;
 
 /// What both sources feed: odometry and the latest readings.
@@ -10,6 +10,8 @@ pub(super) struct Readings {
     pub(super) hits: Vec<[f64; 2]>,
     pub(super) contacts: Contacts,
     pub(super) status: Option<RobotStatus>,
+    /// What pi-node said about itself when it connected.
+    pub(super) node: Option<NodeInfo>,
 }
 
 impl Readings {
@@ -20,6 +22,7 @@ impl Readings {
             hits: Vec::new(),
             contacts: Contacts::default(),
             status: None,
+            node: None,
         }
     }
 
@@ -32,6 +35,7 @@ impl Readings {
             Msg::Lidar(scan) => self.hits = robot_frame_hits(&scan, config),
             Msg::Contacts(c) => self.contacts = c,
             Msg::Status(s) => self.status = Some(s),
+            Msg::Node(n) => self.node = Some(n),
         }
     }
 }

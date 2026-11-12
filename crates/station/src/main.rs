@@ -195,11 +195,15 @@ async fn replay(config: RobotConfig, path: PathBuf) -> Result<()> {
     let mut last_seq: [Option<u32>; 4] = [None; 4];
     for entry in &recording.entries {
         let (i, seq) = match entry {
-            Entry::Msg(m) => match m.msg {
+            Entry::Msg(m) => match &m.msg {
                 Msg::Lidar(_) => (0, Some(m.seq)),
                 Msg::Wheels(_) => (1, Some(m.seq)),
                 Msg::Contacts(_) => (2, Some(m.seq)),
                 Msg::Status(_) => (3, Some(m.seq)),
+                Msg::Node(n) => {
+                    println!("  pi-node: {} {}", n.version, n.settings);
+                    continue;
+                }
             },
             Entry::Command { .. } => (4, None),
             Entry::Truth { .. } => (5, None),

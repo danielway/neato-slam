@@ -17,7 +17,9 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Command, Contacts, LidarScan, Msg, Pose2, RobotStatus, Stamped, WheelPositions};
+use crate::{
+    Command, Contacts, LidarScan, Msg, NodeInfo, Pose2, RobotStatus, Stamped, WheelPositions,
+};
 
 const MAGIC: &[u8; 8] = b"\x89MCAP0\r\n";
 const PROFILE: &str = "neato-slam";
@@ -37,13 +39,14 @@ mod op {
 }
 
 /// Channel ids, fixed so every log uses the same ones.
-const TOPICS: [(u16, &str); 6] = [
+const TOPICS: [(u16, &str); 7] = [
     (1, "/lidar"),
     (2, "/wheels"),
     (3, "/contacts"),
     (4, "/status"),
     (5, "/command"),
     (6, "/ground_truth"),
+    (7, "/node"),
 ];
 
 /// One record of a run.
@@ -170,6 +173,7 @@ impl<W: Write> LogWriter<W> {
             Msg::Wheels(w) => self.message(2, seq, t, w),
             Msg::Contacts(c) => self.message(3, seq, t, c),
             Msg::Status(s) => self.message(4, seq, t, s),
+            Msg::Node(n) => self.message(7, seq, t, n),
         }
     }
 
@@ -360,6 +364,7 @@ fn decode(topic: &str, seq: u32, t_ns: u64, body: &[u8]) -> io::Result<Option<En
         "/wheels" => msg(Msg::Wheels(de::<WheelPositions>(body)?)),
         "/contacts" => msg(Msg::Contacts(de::<Contacts>(body)?)),
         "/status" => msg(Msg::Status(de::<RobotStatus>(body)?)),
+        "/node" => msg(Msg::Node(de::<NodeInfo>(body)?)),
         "/command" => Some(Entry::Command {
             t_ns,
             command: de(body)?,

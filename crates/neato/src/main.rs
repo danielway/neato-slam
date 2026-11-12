@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use neato::cmd;
 use robot::wire::{self, MAX_FRAME_LEN};
-use robot::{Command, Msg, Stamped};
+use robot::{Command, Msg, NodeInfo, Stamped};
 
 use crate::port::NeatoPort;
 
@@ -94,8 +94,10 @@ fn main() -> Result<()> {
     }
 
     eprintln!(
-        "tick {:?}, SetMotor horizon {:?}, stop after {WATCHDOG:?} without a command",
-        timing.tick, timing.horizon
+        "pi-node {}: tick {:?}, SetMotor horizon {:?}, stop after {WATCHDOG:?} without a command",
+        env!("GIT_VERSION"),
+        timing.tick,
+        timing.horizon
     );
     let mut robot = Robot::new(serial);
     robot.stop_style = stop_style;
@@ -388,6 +390,21 @@ fn serve(
 ) -> Result<Option<TcpStream>> {
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // Say what is running here, so the station can show it.
+    let hello = Stamped {
+        t_ns: stamp(clock),
+        seq: 0,
+        msg: Msg::Node(NodeInfo {
+            version: env!("GIT_VERSION").to_owned(),
+            settings: format!(
+                "--stop {} --tick-ms {} --horizon-ms {}",
+                format!("{:?}", robot.stop_style).to_lowercase(),
+                timing.tick.as_millis(),
+                timing.horizon.as_millis()
+            ),
+        }),
+    };
+    stream.write_all(&wire::encode_frame(&hello)?)?;
     let connected = Arc::new(AtomicBool::new(true));
     let latest: Latest = Arc::default();
     let (wake_tx, wake) = mpsc::channel();

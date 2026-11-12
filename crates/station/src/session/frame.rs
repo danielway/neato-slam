@@ -83,6 +83,11 @@ impl Session {
             .collect();
         let extra = json!({
             "run": self.run,
+            "version": env!("GIT_VERSION"),
+            "node": readings.node.as_ref().map(|n| json!({
+                "version": n.version,
+                "settings": n.settings,
+            })),
             "t": readings.t_ns as f64 * 1e-9,
             "odometry": pose(readings.odometry.pose),
             "hits": hits,
