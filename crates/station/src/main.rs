@@ -162,7 +162,7 @@ fn scan(config: RobotConfig, path: PathBuf, at: Option<f64>) -> Result<()> {
 /// spot. Prints CSV `t_s,source,heading_rad` with every heading unwrapped
 /// and measured from its own value at the first scan.
 fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
-    use slam::deskew::{Sweep, deskew, inverse, pose_at};
+    use slam::deskew::{deskew, inverse, pose_at};
     let recording =
         Recording::read_file(&path).with_context(|| format!("reading {}", path.display()))?;
     let t0 = recording.span_ns().map_or(0, |(a, _)| a);
@@ -182,15 +182,10 @@ fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
             track.push((secs(entry), odometry.update(*w)));
         }
     }
-    // Lidar heading three ways: the scan as reported, and de-skewed
-    // assuming the head runs up or down through the beams.
-    let ways: [(&str, Option<Sweep>); 3] = [
-        ("lidar", None),
-        ("lidar_rising", Some(Sweep::Rising)),
-        ("lidar_falling", Some(Sweep::Falling)),
-    ];
-    let mut references: [Option<robot::LidarScan>; 3] = Default::default();
-    let mut lidar: [Unwrap; 3] = Default::default();
+    // Lidar heading two ways: the scan as reported, and de-skewed.
+    let ways = [("lidar", false), ("lidar_deskewed", true)];
+    let mut references: [Option<robot::LidarScan>; 2] = Default::default();
+    let mut lidar: [Unwrap; 2] = Default::default();
     let (mut camera, mut wheels) = (Unwrap::default(), Unwrap::default());
     let mut track_iter = track.iter();
     println!("t_s,source,heading_rad");
@@ -209,16 +204,16 @@ fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
                 msg: Msg::Lidar(scan),
                 ..
             }) => {
-                for (k, (name, sweep)) in ways.iter().enumerate() {
-                    let scan = match (sweep, pose_at(&track, t)) {
-                        (None, _) => scan.clone(),
-                        (Some(sweep), Some(end)) => {
+                for (k, &(name, skewed)) in ways.iter().enumerate() {
+                    let scan = match (skewed, pose_at(&track, t)) {
+                        (false, _) => scan.clone(),
+                        (true, Some(end)) => {
                             let back = inverse(&end);
-                            deskew(scan, &config.lidar, *sweep, |age| {
+                            deskew(scan, &config.lidar, |age| {
                                 back.compose(&pose_at(&track, t - age).unwrap_or(end))
                             })
                         }
-                        (Some(_), None) => continue,
+                        (true, None) => continue,
                     };
                     match &references[k] {
                         None => {

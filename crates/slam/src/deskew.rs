@@ -10,25 +10,13 @@
 
 use robot::{LidarConfig, LidarScan, Pose2};
 
-/// Which way the head runs through the beam indices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sweep {
-    /// Beam 0 is measured first and the last beam last.
-    Rising,
-    /// The last beam is measured first and beam 0 last.
-    Falling,
-}
-
-impl Sweep {
-    /// How long before the end of the sweep beam `i` of `n` was measured,
-    /// as a fraction of the sweep.
-    fn age(self, i: usize, n: usize) -> f64 {
-        let done = (i as f64 + 0.5) / n as f64;
-        match self {
-            Sweep::Rising => 1.0 - done,
-            Sweep::Falling => done,
-        }
-    }
+/// How long before the end of the sweep beam `i` of `n` was measured, as a
+/// fraction of the sweep. The Neato's head runs up through the beams, from
+/// beam 0 to the last: de-skewing that way puts the lidar's heading on the
+/// wheels' through a spin, while the other way scatters it by several
+/// degrees (drive test, 2026-11-12).
+fn age(i: usize, n: usize) -> f64 {
+    1.0 - (i as f64 + 0.5) / n as f64
 }
 
 /// The inverse of a pose: `inverse(p).compose(&p)` is the identity.
@@ -43,12 +31,7 @@ pub fn inverse(p: &Pose2) -> Pose2 {
 /// odometry. The moved points are put back into beams by angle, keeping
 /// the nearest where two land in one beam, so a few beams can come out
 /// empty.
-pub fn deskew(
-    scan: &LidarScan,
-    mount: &LidarConfig,
-    sweep: Sweep,
-    motion: impl Fn(f64) -> Pose2,
-) -> LidarScan {
+pub fn deskew(scan: &LidarScan, mount: &LidarConfig, motion: impl Fn(f64) -> Pose2) -> LidarScan {
     let n = scan.ranges.len();
     let lidar = Pose2::new(mount.x_m, mount.y_m, mount.theta_rad);
     let from_robot = inverse(&lidar);
@@ -59,7 +42,7 @@ pub fn deskew(
             continue;
         }
         let a = scan.angle_min as f64 + i as f64 * inc;
-        let then = motion(sweep.age(i, n) * scan.scan_duration as f64);
+        let then = motion(age(i, n) * scan.scan_duration as f64);
         let (rx, ry) = lidar.transform_point(r as f64 * a.cos(), r as f64 * a.sin());
         let (ex, ey) = then.transform_point(rx, ry);
         let (lx, ly) = from_robot.transform_point(ex, ey);
@@ -120,9 +103,9 @@ mod tests {
         let lidar = Pose2::new(mount.x_m, mount.y_m, 0.0);
         let omega = 45f64.to_radians();
         let period = 0.2;
-        // Behind and to the left, so it falls mid-sweep either way.
+        // Behind and to the left, so it falls mid-sweep.
         let world = (-1.4, 0.6);
-        for sweep in [Sweep::Rising, Sweep::Falling] {
+        {
             // Robot heading at time `age` before the end (end heading 0).
             let heading = |age: f64| -omega * age;
             // Find the beam that sees the point, given its own time.
@@ -134,7 +117,7 @@ mod tests {
                 scan_duration: period as f32,
             };
             for i in 0..360 {
-                let age = sweep.age(i, 360) * period;
+                let age = age(i, 360) * period;
                 let robot = Pose2::new(0.0, 0.0, heading(age));
                 let seen = inverse(&robot.compose(&lidar)).transform_point(world.0, world.1);
                 let k = (seen.1.atan2(seen.0).to_degrees().round() as i64).rem_euclid(360) as usize;
@@ -143,9 +126,7 @@ mod tests {
                 }
             }
             assert!(scan.ranges.iter().any(|r| r.is_finite()));
-            let fixed = deskew(&scan, &mount, sweep, |age| {
-                Pose2::new(0.0, 0.0, heading(age))
-            });
+            let fixed = deskew(&scan, &mount, |age| Pose2::new(0.0, 0.0, heading(age)));
             let at_end = inverse(&lidar).transform_point(world.0, world.1);
             let want =
                 (at_end.1.atan2(at_end.0).to_degrees().round() as i64).rem_euclid(360) as usize;
@@ -154,13 +135,13 @@ mod tests {
             assert!(
                 near.iter()
                     .any(|&r| (r as f64 - at_end.0.hypot(at_end.1)).abs() < 0.02),
-                "{sweep:?}: beams around {want} hold {near:?}"
+                "beams around {want} hold {near:?}"
             );
             // Without de-skewing it would be several beams away.
             let raw = scan.ranges.iter().position(|r| r.is_finite()).unwrap();
             assert!(
                 (raw as i64 - want as i64).rem_euclid(360) >= 3,
-                "{sweep:?}: {raw} vs {want}"
+                "{raw} vs {want}"
             );
         }
     }
