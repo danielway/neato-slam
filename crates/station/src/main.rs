@@ -128,7 +128,7 @@ fn scan(config: RobotConfig, path: PathBuf, at: Option<f64>) -> Result<()> {
     let recording =
         Recording::read_file(&path).with_context(|| format!("reading {}", path.display()))?;
     let t0 = recording.span_ns().map_or(0, |(a, _)| a);
-    let scans = recording.entries.iter().filter_map(|e| match e {
+    let mut scans = recording.entries.iter().filter_map(|e| match e {
         Entry::Msg(robot::Stamped {
             t_ns,
             msg: Msg::Lidar(scan),
@@ -138,7 +138,7 @@ fn scan(config: RobotConfig, path: PathBuf, at: Option<f64>) -> Result<()> {
     });
     let (t, scan) = match at {
         Some(at) => scans.min_by(|a, b| (a.0 - at).abs().total_cmp(&(b.0 - at).abs())),
-        None => scans.last(),
+        None => scans.next_back(),
     }
     .context("no lidar scans in the recording")?;
     let lidar = &config.lidar;
