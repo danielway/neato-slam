@@ -162,40 +162,77 @@ fn scan(config: RobotConfig, path: PathBuf, at: Option<f64>) -> Result<()> {
 /// spot. Prints CSV `t_s,source,heading_rad` with every heading unwrapped
 /// and measured from its own value at the first scan.
 fn headings(config: RobotConfig, path: PathBuf) -> Result<()> {
+    use slam::deskew::{Sweep, deskew, inverse, pose_at};
     let recording =
         Recording::read_file(&path).with_context(|| format!("reading {}", path.display()))?;
     let t0 = recording.span_ns().map_or(0, |(a, _)| a);
     let mut entries: Vec<&Entry> = recording.entries.iter().collect();
     entries.sort_by_key(|e| e.t_ns());
+    let secs = |e: &Entry| e.t_ns().saturating_sub(t0) as f64 * 1e-9;
+    // The wheel track first, so each scan can be de-skewed with where the
+    // robot was during its sweep.
     let mut odometry = WheelOdometry::new(Pose2::default(), config.drive.wheel_base_m);
-    let mut reference: Option<robot::LidarScan> = None;
-    let (mut lidar, mut camera, mut wheels) =
-        (Unwrap::default(), Unwrap::default(), Unwrap::default());
+    let mut track = Vec::new();
+    for entry in &entries {
+        if let Entry::Msg(robot::Stamped {
+            msg: Msg::Wheels(w),
+            ..
+        }) = entry
+        {
+            track.push((secs(entry), odometry.update(*w)));
+        }
+    }
+    // Lidar heading three ways: the scan as reported, and de-skewed
+    // assuming the head runs up or down through the beams.
+    let ways: [(&str, Option<Sweep>); 3] = [
+        ("lidar", None),
+        ("lidar_rising", Some(Sweep::Rising)),
+        ("lidar_falling", Some(Sweep::Falling)),
+    ];
+    let mut references: [Option<robot::LidarScan>; 3] = Default::default();
+    let mut lidar: [Unwrap; 3] = Default::default();
+    let (mut camera, mut wheels) = (Unwrap::default(), Unwrap::default());
+    let mut track_iter = track.iter();
     println!("t_s,source,heading_rad");
     for entry in entries {
-        let t = entry.t_ns().saturating_sub(t0) as f64 * 1e-9;
+        let t = secs(entry);
         match entry {
             Entry::Msg(robot::Stamped {
-                msg: Msg::Wheels(w),
+                msg: Msg::Wheels(_),
                 ..
             }) => {
-                let theta = odometry.update(*w).theta;
-                println!("{t:.4},wheels,{:.4}", wheels.next(theta));
+                if let Some((_, pose)) = track_iter.next() {
+                    println!("{t:.4},wheels,{:.4}", wheels.next(pose.theta));
+                }
             }
             Entry::Msg(robot::Stamped {
                 msg: Msg::Lidar(scan),
                 ..
-            }) => match &reference {
-                None => {
-                    reference = Some(scan.clone());
-                    println!("{t:.4},lidar,{:.4}", lidar.next(0.0));
-                }
-                Some(first) => {
-                    if let Some(turn) = best_turn(first, scan, &config.lidar) {
-                        println!("{t:.4},lidar,{:.4}", lidar.next(turn));
+            }) => {
+                for (k, (name, sweep)) in ways.iter().enumerate() {
+                    let scan = match (sweep, pose_at(&track, t)) {
+                        (None, _) => scan.clone(),
+                        (Some(sweep), Some(end)) => {
+                            let back = inverse(&end);
+                            deskew(scan, &config.lidar, *sweep, |age| {
+                                back.compose(&pose_at(&track, t - age).unwrap_or(end))
+                            })
+                        }
+                        (Some(_), None) => continue,
+                    };
+                    match &references[k] {
+                        None => {
+                            references[k] = Some(scan);
+                            println!("{t:.4},{name},{:.4}", lidar[k].next(0.0));
+                        }
+                        Some(first) => {
+                            if let Some(turn) = best_turn(first, &scan, &config.lidar) {
+                                println!("{t:.4},{name},{:.4}", lidar[k].next(turn));
+                            }
+                        }
                     }
                 }
-            },
+            }
             Entry::Truth { pose, .. } => println!("{t:.4},camera,{:.4}", camera.next(pose.theta)),
             _ => {}
         }

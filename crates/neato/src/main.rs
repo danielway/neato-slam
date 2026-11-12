@@ -3,7 +3,8 @@
 //! It opens the Neato's USB serial port and serves the most recent station
 //! connection. While one is connected it spins the lidar and streams wheel
 //! positions, bumpers, scans and battery state to it, each stamped with the Pi's monotonic
-//! clock when it was read.
+//! clock when it was read. A scan is stamped instead with when its sweep
+//! finished, which `neato::SweepClock` works out from when the reply changes.
 //!
 //! The Neato drops off USB now and then (when it sleeps, or on a marginal
 //! cable) and may come back under a different ttyACM number. A serial error
@@ -41,14 +42,17 @@ use crate::port::NeatoPort;
 
 const USAGE: &str = "usage: pi-node [--serial auto|/dev/ttyACM0] [--listen 0.0.0.0:7878] [--tick-ms 100] [--horizon-ms 300] [--stop disable|tiny|zero]";
 
-/// Wheels and bumpers are polled every tick, the lidar every other tick and
-/// the battery every tenth. Settable with `--tick-ms`.
+/// Wheels and bumpers are polled every tick and the battery every tenth.
+/// Settable with `--tick-ms`. The lidar is asked whenever its next sweep
+/// should have finished (see `neato::SweepClock`).
 const TICK: Duration = Duration::from_millis(100);
 /// How long a drive command lasts, after which the wheels stop.
 const WATCHDOG: Duration = Duration::from_millis(300);
 /// How far ahead each `SetMotor` reaches. Settable with `--horizon-ms`.
 const HORIZON: Duration = Duration::from_millis(300);
-const SCAN_EVERY_TICKS: u32 = 2;
+/// If the lidar's reply hasn't changed for this long, the scene is so still
+/// (or so empty) that sweeps can't be told apart; the reply is sent anyway.
+const SCAN_STALE: Duration = Duration::from_millis(500);
 const CHARGER_EVERY_TICKS: u32 = 10;
 /// Time for the lidar to reach speed after it is switched on.
 const LDS_SPIN_UP: Duration = Duration::from_secs(2);
@@ -203,6 +207,9 @@ struct Robot {
     test_mode: bool,
     stop_style: StopStyle,
     wheels: neato::ContinuousWheels,
+    sweep: neato::SweepClock,
+    /// When the last scan went to the station.
+    last_scan: Option<Instant>,
     last_attempt: Option<Instant>,
     /// The last open failure printed, so retries every 2 s don't flood the log.
     last_error: String,
@@ -218,6 +225,8 @@ impl Robot {
             test_mode: false,
             stop_style: StopStyle::Disable,
             wheels: Default::default(),
+            sweep: neato::SweepClock::new(),
+            last_scan: None,
             last_attempt: None,
             last_error: String::new(),
         }
@@ -276,6 +285,7 @@ impl Robot {
                 eprintln!("lost the Neato ({e:#}); will keep looking for it");
                 self.port = None;
                 self.lidar_on = false;
+                self.sweep.reset();
                 self.moving = false;
                 None
             }
@@ -292,6 +302,8 @@ impl Robot {
         }
         thread::sleep(LDS_SPIN_UP);
         self.lidar_on = true;
+        self.sweep.reset();
+        self.last_scan = Some(Instant::now());
         true
     }
 
@@ -426,7 +438,7 @@ fn serve(
 
     let mut seq = Seqs::default();
     let mut tick: u32 = 0;
-    let result = loop {
+    let result = 'serve: loop {
         if !connected.load(Ordering::Relaxed) {
             break Ok(None);
         }
@@ -448,7 +460,7 @@ fn serve(
                 robot.drive(wanted, timing.horizon);
             }
             let polls = Polls {
-                scan: scanning && tick % SCAN_EVERY_TICKS == 0,
+                scanning,
                 charger: tick % CHARGER_EVERY_TICKS == 0,
             };
             let mut between = |robot: &mut Robot| drive_if_changed(robot, &wake, &latest, timing);
@@ -458,10 +470,26 @@ fn serve(
             tick = tick.wrapping_add(1);
         }
         // Sleep out the tick, but send a changed command the moment it
-        // arrives.
+        // arrives, and ask for a scan the moment its sweep should be done.
         while let Some(rest) = timing.tick.checked_sub(started.elapsed()) {
-            match wake.recv_timeout(rest) {
+            let scanning = robot.lidar_on && robot.port.is_some();
+            let until_scan = match robot.sweep.next_request() {
+                _ if !scanning => rest,
+                // Still finding the sweep timing: ask at every chance.
+                None => Duration::ZERO,
+                Some(due) => {
+                    Duration::from_secs_f64((due - clock.elapsed().as_secs_f64()).max(0.0))
+                }
+            };
+            match wake.recv_timeout(rest.min(until_scan)) {
                 Ok(()) => drive_now(robot, &wake, &latest, timing),
+                Err(_) if until_scan < rest => {
+                    if let Some(scan) = poll_scan(robot, clock, &mut seq)
+                        && let Err(e) = send(&mut stream, &scan)
+                    {
+                        break 'serve Err(e);
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -496,7 +524,8 @@ struct Seqs {
 
 /// The slower queries to include in a round.
 struct Polls {
-    scan: bool,
+    /// Whether the lidar is spinning; it is asked only when a sweep is due.
+    scanning: bool,
     charger: bool,
 }
 
@@ -545,18 +574,10 @@ fn poll_once(
     }
 
     between(robot);
-    if polls.scan {
-        let t = stamp(clock);
-        if let Some(reply) = robot.query(cmd::GET_LDS_SCAN) {
-            match neato::parse_lds_scan(&reply) {
-                Ok(s) => out.push(Stamped {
-                    t_ns: t,
-                    seq: next(&mut seq.lidar),
-                    msg: Msg::Lidar(s),
-                }),
-                Err(e) => log_bad_reply(cmd::GET_LDS_SCAN, &e, &reply),
-            }
-        }
+    if polls.scanning
+        && let Some(scan) = poll_scan(robot, clock, seq)
+    {
+        out.push(scan);
     }
     between(robot);
 
@@ -575,11 +596,49 @@ fn poll_once(
     }
 
     for m in &out {
-        stream
-            .write_all(&wire::encode_frame(m)?)
-            .context("sending to the station")?;
+        send(stream, m)?;
     }
     Ok(())
+}
+
+fn send(stream: &mut TcpStream, m: &Stamped<Msg>) -> Result<()> {
+    stream
+        .write_all(&wire::encode_frame(m)?)
+        .context("sending to the station")
+}
+
+/// Asks for a scan if a sweep should have finished by now. Returns it
+/// stamped with when its sweep finished, or `None` if it isn't due or is
+/// the sweep already sent.
+fn poll_scan(robot: &mut Robot, clock: Instant, seq: &mut Seqs) -> Option<Stamped<Msg>> {
+    let sent = clock.elapsed().as_secs_f64();
+    if !robot.sweep.due(sent) {
+        return None;
+    }
+    let reply = robot.query(cmd::GET_LDS_SCAN)?;
+    let scan = match neato::parse_lds_scan(&reply) {
+        Ok(s) => s,
+        Err(e) => {
+            log_bad_reply(cmd::GET_LDS_SCAN, &e, &reply);
+            return None;
+        }
+    };
+    let hz = if scan.scan_duration > 0.0 {
+        1.0 / scan.scan_duration
+    } else {
+        0.0
+    };
+    let end = match robot.sweep.observe(sent, &reply, hz) {
+        Some(end) => end,
+        None if robot.last_scan.is_some_and(|t| t.elapsed() > SCAN_STALE) => sent,
+        None => return None,
+    };
+    robot.last_scan = Some(Instant::now());
+    Some(Stamped {
+        t_ns: (end.max(0.0) * 1e9) as u64,
+        seq: next(&mut seq.lidar),
+        msg: Msg::Lidar(scan),
+    })
 }
 
 fn stamp(clock: Instant) -> u64 {

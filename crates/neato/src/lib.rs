@@ -239,8 +239,142 @@ pub fn parse_charger(response: &str) -> Result<RobotStatus, ParseError> {
     })
 }
 
+/// Works out when the Neato's lidar finishes each sweep, which the firmware
+/// doesn't report.
+///
+/// `GetLDSScan` returns the last finished sweep, and the whole reply changes
+/// at once when the next one finishes (about every 200 ms). So a reply
+/// that is still the old sweep says the next end is later than its request,
+/// and a new one says the end came before it. Each request holds the serial
+/// link for about 36 ms, so rather than polling fast the clock keeps a
+/// window that must hold the next sweep's end, carries it forward by one
+/// rotation each sweep, and asks in the middle of it. Every reply halves
+/// the window, so it narrows to a few milliseconds and stays there.
+///
+/// Times are seconds on the caller's clock, taken when a request was sent.
+#[derive(Debug, Default)]
+pub struct SweepClock {
+    /// Fingerprint of the last reply's beams.
+    last: Option<u64>,
+    /// The next sweep ends after this...
+    after: Option<f64>,
+    /// ...and no later than this.
+    before: Option<f64>,
+    period: f64,
+}
+
+impl SweepClock {
+    /// How much the window widens each sweep, for the head's speed
+    /// wandering.
+    const SLACK: f64 = 0.0005;
+
+    pub fn new() -> Self {
+        Self {
+            period: 0.2,
+            ..Self::default()
+        }
+    }
+
+    /// When to send the next request, or `None` to ask at every chance
+    /// while there is no window yet.
+    pub fn next_request(&self) -> Option<f64> {
+        Some((self.after? + self.before?) / 2.0)
+    }
+
+    pub fn due(&self, now: f64) -> bool {
+        self.next_request().is_none_or(|t| now >= t)
+    }
+
+    /// Forgets the timing, for when the lidar stops or the port reopens.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Records the reply to a request sent at `sent`. Returns when the sweep
+    /// in it finished if it holds a new sweep, or `None` if it is the one
+    /// seen before.
+    pub fn observe(&mut self, sent: f64, reply: &str, hz: f32) -> Option<f64> {
+        use std::hash::{Hash, Hasher};
+        if (2.0..10.0).contains(&hz) {
+            self.period = 1.0 / hz as f64;
+        }
+        // ROTATION_SPEED updates on its own, so only the beams count.
+        let beams = reply.split("ROTATION_SPEED").next().unwrap_or(reply);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        beams.hash(&mut h);
+        let print = h.finish();
+        let first = self.last.is_none();
+        let fresh = !first && self.last != Some(print);
+        self.last = Some(print);
+
+        if !fresh {
+            // The next end is after this request.
+            self.after = Some(self.after.map_or(sent, |a| a.max(sent)));
+            if self.before.is_some_and(|b| b <= sent) {
+                // The window was wrong; start again from here.
+                self.before = None;
+            }
+            return None;
+        }
+        // Requests may have skipped whole sweeps: this reply is the latest,
+        // so carry the window forward to the last end before the request.
+        if let (Some(a), Some(b)) = (self.after.as_mut(), self.before.as_mut()) {
+            while *a + self.period < sent {
+                *a += self.period;
+                *b += self.period;
+            }
+        }
+        let before = self.before.map_or(sent, |b| b.min(sent));
+        let after = self.after.filter(|&a| a < before);
+        let end = after.map_or(before, |a| (a + before) / 2.0);
+        self.after = after.map(|a| a + self.period - Self::SLACK);
+        self.before = Some(before + self.period + Self::SLACK);
+        Some(end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A fake lidar whose sweeps end at `phase + k * period`, polled the
+    /// way pi-node polls it: at every chance (10 ms apart) without a window,
+    /// else when due but never within 40 ms of the last request, which is
+    /// about what the other queries take. Returns (estimate, truth) per new
+    /// sweep and the number of requests.
+    fn run_clock(phase: f64, period: f64) -> (Vec<(f64, f64)>, usize) {
+        let mut clock = SweepClock::new();
+        let (mut t, mut requests) = (0.0, 0);
+        let mut found = Vec::new();
+        while t < 20.0 {
+            t = match clock.next_request() {
+                None => t + 0.01,
+                Some(due) => due.max(t + 0.04),
+            };
+            requests += 1;
+            let sweep = ((t - phase) / period).floor();
+            let reply = format!("{sweep}\r\nROTATION_SPEED,{}", 1.0 / period);
+            if let Some(end) = clock.observe(t, &reply, (1.0 / period) as f32) {
+                found.push((end, phase + sweep * period));
+            }
+            t += 0.036;
+        }
+        (found, requests)
+    }
+
+    #[test]
+    fn sweep_clock_locks_onto_sweep_ends() {
+        for phase in [0.0, 0.05, 0.123, 0.19] {
+            let (found, requests) = run_clock(phase, 0.1987);
+            // Every sweep is seen, at well under two requests each.
+            assert!(found.len() >= 99, "{phase}: {} sweeps", found.len());
+            assert!(requests < found.len() * 2, "{phase}: {requests} requests");
+            let worst = found[5..]
+                .iter()
+                .map(|(est, truth)| (est - truth).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 0.004, "phase {phase}: off by up to {worst}");
+        }
+    }
     use super::*;
 
     fn lds_response() -> String {

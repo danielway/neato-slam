@@ -5,5 +5,6 @@
 //! occupancy grid mapping from known poses, wheel odometry refined by scan
 //! matching, then pose-graph SLAM with loop closure.
 
+pub mod deskew;
 pub mod eval;
 pub mod odometry;
