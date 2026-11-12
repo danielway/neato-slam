@@ -29,7 +29,8 @@ const USAGE: &str =
        station --headless
        station --replay FILE.mcap
        station --csv FILE.mcap > run.csv
-       station --headings FILE.mcap > headings.csv";
+       station --headings FILE.mcap > headings.csv
+       station --scan FILE.mcap [SECONDS] > scan.csv";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,6 +45,11 @@ async fn main() -> Result<()> {
             "--headless" => return headless(config, start).await,
             "--replay" => return replay(config, args.next().context(USAGE)?.into()).await,
             "--csv" => return csv(args.next().context(USAGE)?.into()),
+            "--scan" => {
+                let path = args.next().context(USAGE)?.into();
+                let at = args.next().map(|s| s.parse()).transpose().context(USAGE)?;
+                return scan(config, path, at);
+            }
             "--headings" => return headings(config, args.next().context(USAGE)?.into()),
             "--listen" => listen = args.next().context(USAGE)?,
             "--recordings" => recordings = args.next().context(USAGE)?.into(),
@@ -111,6 +117,41 @@ fn csv(path: PathBuf) -> Result<()> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// One lidar scan as points in the robot frame (x forward, y left,
+/// metres, from the robot's centre): the scan nearest `at` seconds into the
+/// recording, or the last one. Prints CSV `beam,angle_deg,range_m,x_m,y_m`.
+fn scan(config: RobotConfig, path: PathBuf, at: Option<f64>) -> Result<()> {
+    let recording =
+        Recording::read_file(&path).with_context(|| format!("reading {}", path.display()))?;
+    let t0 = recording.span_ns().map_or(0, |(a, _)| a);
+    let scans = recording.entries.iter().filter_map(|e| match e {
+        Entry::Msg(robot::Stamped {
+            t_ns,
+            msg: Msg::Lidar(scan),
+            ..
+        }) => Some((t_ns.saturating_sub(t0) as f64 * 1e-9, scan)),
+        _ => None,
+    });
+    let (t, scan) = match at {
+        Some(at) => scans.min_by(|a, b| (a.0 - at).abs().total_cmp(&(b.0 - at).abs())),
+        None => scans.last(),
+    }
+    .context("no lidar scans in the recording")?;
+    let lidar = &config.lidar;
+    let mount = Pose2::new(lidar.x_m, lidar.y_m, lidar.theta_rad);
+    println!("# scan at {t:.3} s");
+    println!("beam,angle_deg,range_m,x_m,y_m");
+    for (i, r) in scan.ranges.iter().enumerate() {
+        if !r.is_finite() {
+            continue;
+        }
+        let a = (scan.angle_min + i as f32 * scan.angle_increment) as f64;
+        let (x, y) = mount.transform_point(*r as f64 * a.cos(), *r as f64 * a.sin());
+        println!("{i},{:.1},{r:.3},{x:.3},{y:.3}", a.to_degrees());
     }
     Ok(())
 }
